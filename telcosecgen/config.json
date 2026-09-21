@@ -1,0 +1,24 @@
+{
+  "dataset": {"min_events": 5, "max_events": 30},
+  "verdict_percentages": {
+    "benign": 35,
+    "suspicious": 20,
+    "misaligned": 20,
+    "malicious": 15,
+    "inconclusive": 10
+  },
+  "mission_outcome_percentages": {"completed": 95, "failed": 5},
+  "telecom_context_percentages": {
+    "Mobile Core": 20,
+    "RAN": 20,
+    "IMS / Voice Services": 20,
+    "OSS / BSS / Charging": 20,
+    "Subscriber-Provisioning-Roaming": 20
+  },
+  "severe_case_adjacency": {
+    "enabled": true,
+    "malicious_rate": 0.60,
+    "severe_misaligned_rate": 0.25
+  },
+  "max_repair_attempts": 60
+}

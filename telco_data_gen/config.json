@@ -1,0 +1,12 @@
+{
+  "total_cases": 100,
+  "output_file": "telecom_security_cases.txt",
+  "seed": 20260918,
+  "shuffle_cases": false,
+  "distribution_percent": {
+    "aligned": 70,
+    "single_violation": 15,
+    "contextual_violation": 10,
+    "threat_escalation": 5
+  }
+}
