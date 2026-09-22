@@ -46,16 +46,18 @@ def main(argv: list[str] | None = None) -> int:
         cases, plan = generate_telecom(args.cases, args.seed, config)
         destination = output.resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(serialize_telecom(cases), encoding="utf-8")
+        destination.write_text(serialize_telecom(cases,args.cases), encoding="utf-8")
     except (GenerationError, ValueError, RuntimeError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print("Generation complete")
-    print(f"Domain: telecom\nPrimary cases: {len(cases)}")
+    print(f"Domain: telecom\nRequested items: {args.cases}\nSource items: {len(cases)}")
     for verdict in VERDICTS:
-        print(f"{verdict.title()}: {plan['verdicts'][verdict]}")
+        print(f"Source {verdict}: {plan['verdicts'][verdict]}")
     print(f"Benign twins: {plan['adjacency']['selected']}")
     print(f"Serialized items: {len(cases) + plan['adjacency']['selected']}")
+    for verdict in VERDICTS:
+        print(f"Final {verdict}: {plan['final_verdicts'][verdict]}")
     for context in CONTEXTS:
         print(f"{context}: {plan['contexts'][context]}")
     audit = plan["diversity"]

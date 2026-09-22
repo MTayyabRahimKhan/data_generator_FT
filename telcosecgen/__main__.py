@@ -37,17 +37,20 @@ def main(argv: list[str] | None = None) -> int:
         cases, plan = generate_dataset(args.cases, args.seed, config)
         destination = args.output.resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        rendered = serialize_dataset(cases)
+        rendered = serialize_dataset(cases,args.cases)
         destination.write_text(rendered, encoding="utf-8")
     except (GenerationError, ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print("Generation complete")
-    print(f"Primary cases: {args.cases}")
+    print(f"Requested items: {args.cases}")
+    print(f"Source items: {plan['source_count']}")
     for verdict in VERDICTS:
-        print(f"{verdict.title()}: {plan['verdicts'][verdict]}")
+        print(f"Source {verdict}: {plan['verdicts'][verdict]}")
     print(f"Benign twins: {plan['adjacency']['selected']}")
     print(f"Serialized items: {len(cases) + plan['adjacency']['selected']}")
+    for verdict in VERDICTS:
+        print(f"Final {verdict}: {plan['final_verdicts'][verdict]}")
     print(f"Mission completed: {plan['outcomes']['completed']}")
     print(f"Mission failed: {plan['outcomes']['failed']}")
     for context in CONTEXTS:

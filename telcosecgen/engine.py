@@ -24,7 +24,7 @@ from security_trace_core import (
     repetition_errors, state_change, validate_changed, validate_ordering,
 )
 from security_trace_format import (
-    mission_similarity, serialize_items, validate_mission_similarity, validate_no_label_leakage,
+    mission_similarity, plan_source_labels, serialize_items, validate_mission_similarity, validate_no_label_leakage,
     validate_serialized_dataset,
 )
 
@@ -324,15 +324,17 @@ def forbidden_role_profiles(context: str) -> tuple[tuple[str, ...], ...]:
     return pairs + triples
 
 
-def plan_blueprints(total: int, seed: int, config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
-    verdict_counts = allocate_largest_remainder(total, config["verdict_percentages"], VERDICTS)
-    context_counts = allocate_largest_remainder(total, config["telecom_context_percentages"], CONTEXTS)
-    outcome_counts = allocate_largest_remainder(total, config["mission_outcome_percentages"], ("completed", "failed"))
+def plan_blueprints(total: int, seed: int, config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    count_plan=plan_source_labels(total,config["verdict_percentages"],VERDICTS)
+    source_total=count_plan["source_count"]
+    verdict_counts = count_plan["source_labels"]
+    context_counts = allocate_largest_remainder(source_total, config["telecom_context_percentages"], CONTEXTS)
+    outcome_counts = allocate_largest_remainder(source_total, config["mission_outcome_percentages"], ("completed", "failed"))
     rng = random.Random(seed)
     verdicts = _assign(verdict_counts, rng)
     contexts = _assign(context_counts, rng)
     outcomes = _assign(outcome_counts, rng)
-    bucket_counts = allocate_largest_remainder(total, {"short": 35, "medium": 45, "long": 20}, ("short", "medium", "long"))
+    bucket_counts = allocate_largest_remainder(source_total, {"short": 35, "medium": 45, "long": 20}, ("short", "medium", "long"))
     buckets = _assign(bucket_counts, rng)
     ranges = {"short": (5, 9), "medium": (10, 18), "long": (19, 30)}
     blueprints = []
@@ -343,7 +345,7 @@ def plan_blueprints(total: int, seed: int, config: dict[str, Any]) -> tuple[list
     role_usage: Counter[tuple[str, str, str, tuple[str, ...]]] = Counter()
     forbidden_usage: Counter[tuple[str, str, str, tuple[str, ...]]] = Counter()
     deviation_ordinal = 0
-    for i in range(total):
+    for i in range(source_total):
         candidates = [spec for spec in SPECS if spec.context == contexts[i]]
         least_domain_use = min(domain_usage[(contexts[i], verdicts[i], candidate.domain)] for candidate in candidates)
         available = [candidate for candidate in candidates if domain_usage[(contexts[i], verdicts[i], candidate.domain)] == least_domain_use]
@@ -378,7 +380,7 @@ def plan_blueprints(total: int, seed: int, config: dict[str, Any]) -> tuple[list
             "violation_mechanism": (i + seed) % 8, "failure_mechanism": (i * 5 + seed) % len(FAILURES),
             "evidence_gap_type": (i * 7 + seed) % 8,
         })
-    return blueprints, {"verdicts": verdict_counts, "contexts": context_counts, "outcomes": outcome_counts, "length_buckets": bucket_counts}
+    return blueprints, {"verdicts": verdict_counts, "final_verdicts":count_plan["final_labels"],"requested_total":total,"source_count":source_total,"twin_count":count_plan["twin_count"],"contexts": context_counts, "outcomes": outcome_counts, "length_buckets": bucket_counts}
 
 
 def _event(number: int, kind: str, target: str, payload: str = "", intent: str = AUTHORIZED) -> dict[str, Any]:
@@ -936,6 +938,7 @@ def validate_dataset(
     config: dict[str, Any] | None = None,
     *,
     precomputed_audit: dict[str, Any] | None = None,
+    expected_verdicts: dict[str,int] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     if expected_count is not None and len(cases) != expected_count:
@@ -955,7 +958,7 @@ def validate_dataset(
     if excessive_text_clusters([case["OUTPUT"]["explanation"] for case in cases]):
         errors.append("telecom explanations are excessively duplicated")
     if config is not None and expected_count is not None:
-        expected_v = allocate_largest_remainder(expected_count, config["verdict_percentages"], VERDICTS)
+        expected_v = expected_verdicts or allocate_largest_remainder(expected_count, config["verdict_percentages"], VERDICTS)
         expected_c = allocate_largest_remainder(expected_count, config["telecom_context_percentages"], CONTEXTS)
         expected_o = allocate_largest_remainder(expected_count, config["mission_outcome_percentages"], ("completed", "failed"))
         actual_v = Counter(c["OUTPUT"]["verdict"] for c in cases)
@@ -1068,10 +1071,10 @@ def generate_dataset(total: int, seed: int = 42, config: dict[str, Any] | None =
     twin_count=sum(case["OUTPUT"]["verdict"] in {"suspicious","misaligned","malicious"} for case in cases)
     plan["adjacency"]={"selected":twin_count,"before":0,"after":twin_count}
     plan["diversity"] = diversity_audit(cases, threshold)
-    errors = validate_dataset(cases, total, cfg, precomputed_audit=plan["diversity"])
+    errors = validate_dataset(cases, plan["source_count"], cfg, precomputed_audit=plan["diversity"],expected_verdicts=plan["verdicts"])
     if errors:
         raise GenerationError("dataset validation failed: " + "; ".join(errors[:10]))
-    serialize_dataset(cases)
+    serialize_dataset(cases,total)
     return cases, plan
 
 
@@ -1084,8 +1087,8 @@ def public_case(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def serialize_dataset(cases: list[dict[str, Any]]) -> str:
+def serialize_dataset(cases: list[dict[str, Any]],expected_total: int | None=None) -> str:
     items=[public_case(case) for case in dataset_cases(cases)]
     text=serialize_items(items,"allowed telecom actions","payload")
-    validate_serialized_dataset(text,"allowed telecom actions",len(cases),.90)
+    validate_serialized_dataset(text,"allowed telecom actions",expected_total or len(items),.90)
     return text

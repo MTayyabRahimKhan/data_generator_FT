@@ -87,8 +87,12 @@ immediately by one benign twin. The source and twin must:
 Standalone benign and inconclusive primary items each receive a unique
 `family_id`. Twins are serialized as ordinary adjacent items with the exact
 same schema; there is no `COUNTERFACTUAL` wrapper and no pairing key other than
-`family_id`. Twins do not count toward `--cases N` or the primary-label
-distribution.
+`family_id`.
+
+Benign twins count toward `--cases N`. The requested value is the exact final
+number of serialized items, including both source items and twins. The
+primary-label distribution applies to source items only; generated twins do
+not alter those source-label counts, but they do consume output slots.
 
 ### Event-Neutrality and Label-Leakage Rules
 
@@ -169,7 +173,8 @@ The system must never use mission success or failure as a proxy for security cla
 
 The system must:
 
-1. Generate a user-requested number of primary cases.
+1. Generate exactly the user-requested number of final serialized items,
+   including benign twins.
 2. Support one-command end-to-end dataset generation.
 3. Enforce configurable verdict distributions.
 4. Enforce configurable mission-completion distributions.
@@ -177,7 +182,7 @@ The system must:
 6. Include ordinary operational steps and side steps.
 7. Generate realistic domain-specific scenarios.
 8. Produce adjacent benign twins for suspicious, misaligned, and malicious primary cases.
-9. Keep benign twins outside the primary-case count.
+9. Count benign twins as part of the requested dataset size.
 10. Enforce structural and semantic validity.
 11. Detect and reject near-duplicate scenarios.
 12. Support deterministic planning through a random seed.
@@ -265,7 +270,7 @@ ERROR: --cases must be a positive integer.
 
 The dataset size must not be hardcoded.
 
-The number of primary cases comes from:
+The final serialized dataset size comes from:
 
 ```text
 --cases N
@@ -280,14 +285,36 @@ If the user requests:
 the final dataset must contain exactly:
 
 ```text
-73 primary cases
+73 serialized items, including all required benign twins
 ```
 
-Serialized benign twins do not count toward `N`.
+Let `P` be the number of source items and `T` the number of required benign
+twins. The generator must guarantee:
+
+```text
+P + T = N
+T = suspicious_sources + misaligned_sources + malicious_sources
+```
+
+The planner must solve source-label allocation and twin requirements before
+trace generation. It must not generate `N` source items and append twins.
+
+For arbitrary `N`, evaluate each feasible source count from `ceil(N / 2)`
+through `N`. For each candidate, let `T = N - P`, allocate exactly `T`
+twin-required sources across suspicious, misaligned, and malicious using their
+relative configured weights, and allocate the remaining `P - T` sources
+across benign and inconclusive using their relative configured weights. Use
+deterministic largest-remainder allocation within both groups. Select the
+candidate with the smallest total absolute deviation from the configured
+source-label percentages; break ties deterministically in favor of the larger
+source count and then the configured label order.
+
+Always preserve at least one benign twin for every remaining suspicious,
+misaligned, or malicious source item.
 
 Validation, repair, rejection, and deduplication must not reduce the requested
-dataset size. Any rejected primary case must be regenerated until the final
-validated dataset contains exactly `N` primary cases.
+dataset size. Any rejected source or twin must be regenerated until the final
+validated dataset contains exactly `N` serialized items.
 
 ---
 
@@ -439,23 +466,21 @@ generate one benign twin.
 
 ### 10.1 Benign Twin Count Semantics
 
-Counterfactuals do not count toward `--cases N`.
+Benign twins count toward `--cases N`. For example, `--cases 100` means that
+source items and twins together must total exactly 100; it does not mean 100
+sources followed by additional twins.
 
-For 100 primary cases under the default distribution:
-
-- 35 benign
-- 20 suspicious
-- 20 misaligned
-- 15 malicious
-- 10 inconclusive
-
-Required serialized benign twins:
+Under the default percentages, deterministic planning selects 65 source
+items with source-label counts of 23 benign, 13 suspicious, 13 misaligned,
+9 malicious, and 7 inconclusive. Those sources require 35 twins, producing:
 
 ```text
-20 + 20 + 15 = 55
+65 source items + 35 benign twins = 100 serialized items
 ```
 
-Primary case count remains 100.
+The final serialized benign count is therefore the standalone/source benign
+count plus the twin count. Distribution reporting must show source-label
+counts separately from final serialized-label counts.
 
 ### 10.2 Benign Twin Principle
 
@@ -752,18 +777,18 @@ Compare unrelated primary cases using:
 Reject or regenerate cases that differ only by IDs, suffixes, region names, ticket IDs, timestamps, or literal values.
 
 No pair of unrelated primary cases may have an overall similarity score greater
-than 85% across the comparison dimensions above.
+than 90% across the comparison dimensions above.
 
 Case uniqueness must account for the complete event course, not only the mission.
 Cases with the same mission may be treated as distinct when they differ
 meaningfully in event sequence, event ordering, or number of events. Likewise,
 individual events or other case attributes may be shared, provided the complete
-case remains at or below the 85% similarity threshold.
+case remains at or below the 90% similarity threshold.
 
 Duplicate or over-threshold cases must be regenerated until both the uniqueness
-requirements and the exact requested primary-case count are satisfied.
+requirements and the exact requested serialized-item count are satisfied.
 
-Counterfactual pairs are exempt.
+Source/twin pairs in the same family are exempt.
 
 ---
 
@@ -806,8 +831,11 @@ Examples include:
 
 Code determines:
 
-- requested N
-- verdict counts
+- requested final serialized count N
+- source-item count P
+- benign-twin count T
+- source-label counts
+- final serialized-label counts
 - domain/context counts
 - mission-outcome counts
 - event-length buckets
@@ -1648,9 +1676,10 @@ and separated using:
 
 Do not wrap the complete dataset in Markdown code fences.
 
-The output file must contain exactly `N` primary items plus the required
-top-level benign twins. Twins do not count toward `N`. Every serialized item
-must have the same exact key set defined by the normative contract.
+The output file must contain exactly `N` total serialized items. This total
+includes all source items and all required top-level benign twins. Every
+serialized item must have the same exact key set defined by the normative
+contract.
 
 ---
 
@@ -1659,8 +1688,10 @@ must have the same exact key set defined by the normative contract.
 After generation, print a concise dynamically calculated summary including:
 
 - domain
-- primary case count
-- verdict counts
+- requested/final serialized item count
+- source-item count
+- source-label counts
+- final serialized-label counts
 - benign-twin count
 - mission completion counts
 - context counts
@@ -1673,11 +1704,13 @@ After generation, print a concise dynamically calculated summary including:
 
 Before output, validate:
 
-- primary case count equals requested N
-- verdict counts sum to N
-- verdict allocation matches deterministic apportionment
-- mission outcome counts sum to N
-- context counts sum to N
+- serialized source-item count plus benign-twin count equals requested `N`
+- actual serialized item count equals requested `N`
+- source-label counts sum to the source-item count
+- final serialized-label counts sum to `N`
+- source-label allocation matches deterministic constrained apportionment
+- mission outcome counts sum to the source-item count
+- context counts sum to the source-item count
 - valid and correctly shared family IDs
 - valid label enum
 - valid authorised enum
@@ -1850,16 +1883,17 @@ secgen/
 
 The system is complete only when one command can:
 
-- generate exactly N primary cases
-- apply the configured verdict distribution
-- apply the configured mission-completion distribution
-- apply domain/context distribution
+- generate exactly N final serialized items, including benign twins
+- apply the configured source-label distribution as closely as possible under
+  the exact-count and mandatory-twin constraints
+- apply the configured mission-completion distribution to source items
+- apply domain/context distribution to source items
 - generate 5–30 events per trace
 - include realistic side steps
 - scope all side steps correctly
 - avoid template duplication
 - generate required adjacent benign twins
-- exclude benign twins from N
+- include benign twins in N
 - validate first deviation
 - validate contributing events
 - validate persisted changes

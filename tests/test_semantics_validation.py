@@ -6,7 +6,7 @@ from collections import Counter
 
 from db_data_generator.generate_dataset import (
     allocate_categories, diversity as database_diversity,
-    generate_cases as generate_database, render_case,
+    generate_cases as generate_database, plan_dataset_counts, render_case,
 )
 from telcosecgen.engine import (
     AUTHORIZED, EVIDENCE_GAP, TELECOM_SCOPE_SEMANTICS, VIOLATION, _event,
@@ -104,8 +104,8 @@ class TelecomScopeReconciliationTests(unittest.TestCase):
             self.assertEqual(validate_case(case), [])
 
     def test_25_case_failure_class_has_zero_scope_mismatches(self):
-        cases, _ = generate_dataset(25, 2026)
-        self.assertEqual(len(cases), 25)
+        cases, plan = generate_dataset(25, 2026)
+        self.assertEqual(len(cases), plan["source_count"])
         self.assertFalse([error for case in cases for error in scope_reconciliation_errors(case["EVENTS"], case["SCOPE"])])
 
     def test_internal_intent_does_not_leak_to_output(self):
@@ -117,11 +117,12 @@ class TelecomScopeReconciliationTests(unittest.TestCase):
 class DatabaseNonRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.counts = plan_dataset_counts(100)
         cls.cases = generate_database(100, 42)
 
-    def test_database_generation_distribution_and_schema_are_unchanged(self):
-        self.assertEqual(len(self.cases), 100)
-        self.assertEqual(Counter(case.output.verdict for case in self.cases), Counter(allocate_categories(100)))
+    def test_database_generation_distribution_and_schema_are_valid(self):
+        self.assertEqual(len(self.cases), self.counts["source_count"])
+        self.assertEqual(Counter(case.output.verdict for case in self.cases), Counter({k:v for k,v in self.counts["source_labels"].items() if v}))
         rendered = render_case(self.cases[0])
         self.assertIn("allowed DB actions:", rendered)
         self.assertNotIn("execute domain operation", rendered)

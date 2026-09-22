@@ -31,6 +31,43 @@ EVENT_RE = re.compile(r"^  (?P<number>\d+)  (?P<kind>\S+)(?:  (?P<target>\S+))?(
 FAMILY_RE = re.compile(r"^(?:DB|TELCO)-FAMILY-\d{6}$")
 
 
+def largest_remainder(total: int, weights: Mapping[str, int | float], order: Sequence[str]) -> dict[str, int]:
+    if total < 0:
+        raise ValueError("allocation total cannot be negative")
+    denominator=sum(weights[name] for name in order)
+    if denominator <= 0:
+        if total:
+            raise ValueError("positive allocation requires positive weights")
+        return {name:0 for name in order}
+    quotas={name:total*weights[name]/denominator for name in order}
+    result={name:int(quotas[name]) for name in order}
+    ranked=sorted(order,key=lambda name:(-(quotas[name]-result[name]),order.index(name)))
+    for name in ranked[:total-sum(result.values())]:result[name]+=1
+    return result
+
+
+def plan_source_labels(final_total: int, percentages: Mapping[str, int | float], order: Sequence[str]) -> dict[str, Any]:
+    """Allocate source labels while counting mandatory twins inside final_total."""
+    if final_total < 1:
+        raise ValueError("--cases must be a positive integer")
+    standalone=[name for name in order if name not in TWIN_REQUIRED]
+    severe=[name for name in order if name in TWIN_REQUIRED]
+    best=None
+    for source_total in range((final_total+1)//2,final_total+1):
+        twin_total=final_total-source_total
+        if twin_total>source_total:continue
+        standalone_total=source_total-twin_total
+        severe_counts=largest_remainder(twin_total,percentages,severe)
+        standalone_counts=largest_remainder(standalone_total,percentages,standalone)
+        counts={name:severe_counts.get(name,standalone_counts.get(name,0)) for name in order}
+        error=sum(abs(counts[name]-source_total*percentages[name]/sum(percentages.values())) for name in order)
+        candidate=(round(error,12),-source_total,counts,source_total,twin_total)
+        if best is None or candidate[:2]<best[:2]:best=candidate
+    _,_,counts,source_total,twin_total=best
+    final_labels=dict(counts);final_labels["benign"]+=twin_total
+    return {"source_labels":counts,"source_count":source_total,"twin_count":twin_total,"final_labels":final_labels,"final_count":final_total}
+
+
 def _csv(values: Iterable[str]) -> str:
     return ", ".join(str(value) for value in values)
 
@@ -183,7 +220,7 @@ def _parse_document(document: str, action_key: str) -> dict[str, Any]:
 def validate_serialized_dataset(
     text: str,
     action_key: str,
-    expected_primary_count: int | None = None,
+    expected_total_count: int | None = None,
     mission_similarity_limit: float = 0.90,
 ) -> list[dict[str, Any]]:
     if not text.endswith("\n"):
@@ -192,8 +229,8 @@ def validate_serialized_dataset(
     families: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for document in documents:
         families[document["family_id"]].append(document)
-    if expected_primary_count is not None and len(families) != expected_primary_count:
-        raise ValueError(f"primary family count is {len(families)}, expected {expected_primary_count}")
+    if expected_total_count is not None and len(documents) != expected_total_count:
+        raise ValueError(f"serialized item count is {len(documents)}, expected {expected_total_count}")
     for family, members in families.items():
         labels = [member["label"] for member in members]
         source_labels = [label for label in labels if label in TWIN_REQUIRED]

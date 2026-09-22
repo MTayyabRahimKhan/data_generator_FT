@@ -18,13 +18,15 @@ class TelecomGeneratorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cases,cls.plan=generate_dataset(100,42)
-        cls.text=serialize_dataset(cls.cases)
+        cls.text=serialize_dataset(cls.cases,100)
         cls.documents=validate_serialized_dataset(cls.text,"allowed telecom actions",100)
 
     def test_distribution_count_and_twins(self):
         expected=dict(zip(VERDICTS,(35,20,20,15,10)))
-        self.assertEqual(Counter(c["OUTPUT"]["verdict"] for c in self.cases),expected)
-        self.assertEqual(len(self.documents),155)
+        self.assertEqual(Counter(c["OUTPUT"]["verdict"] for c in self.cases),Counter({k:v for k,v in self.plan["verdicts"].items() if v}))
+        self.assertEqual(len(self.cases),self.plan["source_count"])
+        self.assertEqual(len(self.documents),100)
+        self.assertEqual(len(self.documents)-len(self.cases),self.plan["twin_count"])
         self.assertEqual(allocate_largest_remainder(101,expected,VERDICTS),{"benign":36,"suspicious":20,"misaligned":20,"malicious":15,"inconclusive":10})
 
     def test_exact_public_keys(self):
@@ -80,9 +82,9 @@ class TelecomGeneratorTests(unittest.TestCase):
 
     def test_repeated_seeded_generations(self):
         for seed in (1,7,42,314,2026):
-            cases,_=generate_dataset(25,seed)
-            self.assertEqual(validate_dataset(cases,25,load_config()),[])
-            validate_serialized_dataset(serialize_dataset(cases),"allowed telecom actions",25)
+            cases,plan=generate_dataset(25,seed)
+            self.assertEqual(validate_dataset(cases,plan["source_count"],load_config(),expected_verdicts=plan["verdicts"]),[])
+            validate_serialized_dataset(serialize_dataset(cases,25),"allowed telecom actions",25)
 
     def test_package_cli(self):
         with tempfile.TemporaryDirectory() as directory:

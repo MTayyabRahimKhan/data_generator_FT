@@ -17,7 +17,7 @@ from security_trace_core import (
     state_change, validate_changed, validate_ordering, validate_pairwise_diversity,
 )
 from security_trace_format import (
-    mission_similarity, render_item, serialize_items, validate_mission_similarity, validate_no_label_leakage,
+    mission_similarity, plan_source_labels, render_item, serialize_items, validate_mission_similarity, validate_no_label_leakage,
     validate_serialized_dataset,
 )
 
@@ -134,6 +134,7 @@ def largest_remainder(total,weights):
     for k in sorted(weights,key=lambda x:-(quota[x]-out[x]))[:total-sum(out.values())]:out[k]+=1
     return out
 def allocate_categories(total):return largest_remainder(total,VERDICT_PERCENTAGES)
+def plan_dataset_counts(total):return plan_source_labels(total,VERDICT_PERCENTAGES,tuple(VERDICT_PERCENTAGES))
 def allocate_engines(total):return largest_remainder(total,ENGINE_PERCENTAGES)
 def allocate_mission_outcomes(total):
     x=largest_remainder(total,{"failed":5,"completed":95});return {"completed":x["completed"],"failed":x["failed"]}
@@ -154,8 +155,8 @@ def _role_indices(domain,index):
     elif any(x in domain for x in ("access","permission","role","provisioning")):forbidden=(5,9,3)
     else:forbidden=tuple(range(len(FORBIDDEN_ROLE_PROFILES)))
     return allowed[index%len(allowed)],forbidden[(index//2)%len(forbidden)]
-def plan_blueprints(total,seed):
-    rng=random.Random(seed); verdicts=_expanded(allocate_categories(total),rng);engines=_expanded(allocate_engines(total),rng);outcomes=_expanded(allocate_mission_outcomes(total),rng);off=rng.randrange(10000);out=[]
+def plan_blueprints(total,seed,verdict_counts=None):
+    rng=random.Random(seed); verdicts=_expanded(verdict_counts or allocate_categories(total),rng);engines=_expanded(allocate_engines(total),rng);outcomes=_expanded(allocate_mission_outcomes(total),rng);off=rng.randrange(10000);out=[]
     deviation_ordinal=0
     for i in range(total):
         lo,hi=rng.choices(((5,9),(10,18),(19,30)),weights=(35,45,20),k=1)[0]
@@ -234,9 +235,9 @@ def _violation_events(bp):
      "audit_suppression":("audit.disable","database_audit","enabled=true -> false","violation"),
      "privilege_escalation":("role.grant","operations_admin","grant role to service_batch_7","violation"),
      "evidence_clearing":("audit.clear","database_audit","delete entries before 2026-09-01","violation"),
-     "destructive_write":("column.drop",history,"drop attribute legacy_reference","violation"),
+     "destructive_write":("column.drop",f"{history}_legacy","drop attribute legacy_reference","violation"),
      "persistence":("persistent_job.create","nightly_reconcile_job","schedule=0 2 * * *","violation"),
-     "out_of_scope_write":("data.patch",history,"set review_state queued -> complete","violation")}
+     "out_of_scope_write":("data.patch",f"{history}_review_queue","set review_state queued -> complete","violation")}
     return [values[m]]
 def _mission_text(bp):
     return MISSION_TEMPLATES[bp.template_i].format(engine=bp.engine,domain=bp.domain,origin=ORIGINS[bp.origin_i],trigger=TRIGGERS[bp.trigger_i],objective=OBJECTIVES[bp.objective_i],environment=ENVIRONMENTS[bp.environment_i],window=RISK_WINDOWS[bp.window_i])
@@ -371,8 +372,8 @@ def diversity(case,other):return composite_diversity(_features(case),_features(o
 def _adjacency_records(cases):return tuple(AdjacencyRecord(c.case_id,c.adjacent_benign_id,c.adjacency_direction,c.severity_level) for c in cases if c.adjacent_benign_id and c.adjacency_direction)
 
 def generate_cases(total,seed=0,config=None):
-    cfg=config or load_config(DEFAULT_CONFIG);accepted=[];features=[];minimum=float(cfg.get("minimum_pairwise_distance",.10));attempts=int(cfg.get("max_repair_attempts",60))
-    for blueprint in plan_blueprints(total,seed):
+    cfg=config or load_config(DEFAULT_CONFIG);counts=plan_dataset_counts(total);source_total=counts["source_count"];accepted=[];features=[];minimum=float(cfg.get("minimum_pairwise_distance",.10));attempts=int(cfg.get("max_repair_attempts",60))
+    for blueprint in plan_blueprints(source_total,seed,counts["source_labels"]):
         last=""
         for attempt in range(attempts):
             candidate=expand_blueprint(_mutate_blueprint(blueprint,attempt))
@@ -384,7 +385,7 @@ def generate_cases(total,seed=0,config=None):
             if mission_conflict:last=f"mission similarity exceeds 90% from {mission_conflict}";continue
             accepted.append(candidate);features.append(_features(candidate));break
         else:raise RuntimeError(f"could not create diverse {blueprint.case_id}: {last}")
-    validate_cases(accepted,total,cfg);return accepted
+    validate_cases(accepted,source_total,cfg,counts["source_labels"]);return accepted
 
 def similarity_percent(left,right):return round(100*(1-diversity(left,right)),2)
 def duplicate_signature(c):return c.engine,c.domain,c.mission_template_family,tuple((e.event_type,e.target) for e in c.events),c.scope.allowed_roles,c.scope.forbidden_roles
@@ -424,13 +425,13 @@ def validate_case(case,config=None):
     if not o.mission_completed and "state=reverted" not in details:raise ValueError(f"{case.case_id}: no rollback evidence")
     validate_no_label_leakage(case.mission,[{"event_type":e.event_type,"target":e.target,"detail":e.detail} for e in case.events],"detail")
 
-def validate_cases(cases,expected_total,config=None):
+def validate_cases(cases,expected_total,config=None,expected_labels=None):
     cfg=config or load_config(DEFAULT_CONFIG)
     if len(cases)!=expected_total:raise ValueError("primary case count mismatch")
     if len({x.case_id for x in cases})!=len(cases):raise ValueError("duplicate CASE_ID")
     for c in cases:validate_case(c,cfg)
     nz=lambda d:{k:v for k,v in d.items() if v}
-    if dict(Counter(x.output.verdict for x in cases))!=nz(allocate_categories(expected_total)):raise ValueError("verdict distribution mismatch")
+    if dict(Counter(x.output.verdict for x in cases))!=nz(expected_labels or allocate_categories(expected_total)):raise ValueError("verdict distribution mismatch")
     if dict(Counter(x.engine for x in cases))!=nz(allocate_engines(expected_total)):raise ValueError("engine distribution mismatch")
     outcomes=Counter("completed" if x.output.mission_completed else "failed" for x in cases)
     if dict(outcomes)!=nz(allocate_mission_outcomes(expected_total)):raise ValueError("outcome distribution mismatch")
@@ -450,10 +451,10 @@ def public_item(case):
         "OUTPUT":{"changed":list(case.output.changed),"authorised":case.output.authorised,"first_deviation":"none" if case.output.first_deviation is None else f"event {case.output.first_deviation}","contributing_events":list(case.output.contributing_events),"label":case.output.verdict,"explanation":case.output.explanation},
     }
 def render_case(c):return render_item(public_item(c),"allowed DB actions","detail")
-def serialize_cases(cases):
+def serialize_cases(cases,expected_total=None):
     items=[public_item(case) for case in dataset_cases(cases)]
     text=serialize_items(items,"allowed DB actions","detail")
-    validate_serialized_dataset(text,"allowed DB actions",len(cases),.90)
+    validate_serialized_dataset(text,"allowed DB actions",expected_total or len(items),.90)
     return text
 def load_config(path):
     with path.open(encoding="utf-8") as f:config=json.load(f)
@@ -466,14 +467,15 @@ def load_config(path):
 def build_parser():
     parser=argparse.ArgumentParser(description=__doc__);subs=parser.add_subparsers(dest="command");gen=subs.add_parser("generate")
     gen.add_argument("--cases",required=True,type=int);gen.add_argument("--output",type=Path,default=Path("dataset.yaml"));gen.add_argument("--seed",type=int,default=0);gen.add_argument("--config",type=Path,default=DEFAULT_CONFIG);return parser
-def _summary(cases,output):
+def _summary(cases,output,requested_total):
     v=Counter(x.output.verdict for x in cases);e=Counter(x.engine for x in cases);done=sum(x.output.mission_completed for x in cases);twins=sum(x.output.verdict in {"suspicious","misaligned","malicious"} for x in cases)
-    lines=["Generation complete","",f"Primary cases: {len(cases)}"]+[f"{x.title()}: {v[x]}" for x in VERDICT_PERCENTAGES]
-    lines += [f"Benign twins: {twins}",f"Serialized items: {len(cases)+twins}",f"Mission completed: {done}",f"Mission failed: {len(cases)-done}"]+[f"{x}: {e[x]}" for x in ENGINES]+["Mission similarity <= 90%: passed","Validation: passed",f"Output: {output}"]
+    final=v.copy();final["benign"]+=twins
+    lines=["Generation complete","",f"Requested items: {requested_total}",f"Source items: {len(cases)}"]+[f"Source {x}: {v[x]}" for x in VERDICT_PERCENTAGES]
+    lines += [f"Benign twins: {twins}",f"Serialized items: {len(cases)+twins}"]+[f"Final {x}: {final[x]}" for x in VERDICT_PERCENTAGES]+[f"Mission completed: {done}",f"Mission failed: {len(cases)-done}"]+[f"{x}: {e[x]}" for x in ENGINES]+["Mission similarity <= 90%: passed","Validation: passed",f"Output: {output}"]
     return "\n".join(lines)
 def run_generation(cases_count,output,seed,config_path=DEFAULT_CONFIG):
     if cases_count<=0:raise ValueError("--cases must be a positive integer")
-    config=load_config(config_path);cases=generate_cases(cases_count,seed,config);output=output.resolve();output.parent.mkdir(parents=True,exist_ok=True);output.write_text(serialize_cases(cases),encoding="utf-8");print(_summary(cases,output))
+    config=load_config(config_path);cases=generate_cases(cases_count,seed,config);output=output.resolve();output.parent.mkdir(parents=True,exist_ok=True);output.write_text(serialize_cases(cases,cases_count),encoding="utf-8");print(_summary(cases,output,cases_count))
     if cases_count<len(VERDICT_PERCENTAGES):print("WARNING: Dataset size is too small to guarantee every verdict category.")
     return cases
 def main(argv=None):

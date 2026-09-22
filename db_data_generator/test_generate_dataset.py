@@ -6,7 +6,8 @@ from pathlib import Path
 
 from db_data_generator.generate_dataset import (
     allocate_categories, dataset_cases, generate_cases, public_item,
-    run_generation, serialize_cases, validate_case, validate_cases,
+    plan_dataset_counts, run_generation, serialize_cases, validate_case,
+    validate_cases,
 )
 from security_trace_format import leakage_matches, mission_similarity, validate_serialized_dataset
 
@@ -14,15 +15,17 @@ from security_trace_format import leakage_matches, mission_similarity, validate_
 class DatabaseGeneratorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.counts=plan_dataset_counts(100)
         cls.cases=generate_cases(100,42)
-        cls.text=serialize_cases(cls.cases)
+        cls.text=serialize_cases(cls.cases,100)
         cls.documents=validate_serialized_dataset(cls.text,"allowed DB actions",100)
 
     def test_primary_distribution_and_serialized_twin_count(self):
-        self.assertEqual(len(self.cases),100)
-        self.assertEqual(Counter(c.output.verdict for c in self.cases),Counter(allocate_categories(100)))
-        self.assertEqual(len(self.documents),155)
-        self.assertEqual(len({d["family_id"] for d in self.documents}),100)
+        self.assertEqual(len(self.cases),self.counts["source_count"])
+        self.assertEqual(Counter(c.output.verdict for c in self.cases),Counter({k:v for k,v in self.counts["source_labels"].items() if v}))
+        self.assertEqual(len(self.documents),100)
+        self.assertEqual(len({d["family_id"] for d in self.documents}),self.counts["source_count"])
+        self.assertEqual(len(self.documents)-len(self.cases),self.counts["twin_count"])
 
     def test_exact_public_keys(self):
         item=public_item(self.cases[0])
@@ -66,9 +69,10 @@ class DatabaseGeneratorTests(unittest.TestCase):
 
     def test_repeated_seeded_generations_validate(self):
         for seed in (1,7,42,314,2026):
+            counts=plan_dataset_counts(25)
             cases=generate_cases(25,seed)
-            validate_cases(cases,25)
-            validate_serialized_dataset(serialize_cases(cases),"allowed DB actions",25)
+            validate_cases(cases,counts["source_count"],expected_labels=counts["source_labels"])
+            validate_serialized_dataset(serialize_cases(cases,25),"allowed DB actions",25)
 
     def test_semantic_validation_rejects_bad_authorisation(self):
         case=next(c for c in self.cases if c.output.verdict=="malicious")
@@ -76,12 +80,12 @@ class DatabaseGeneratorTests(unittest.TestCase):
 
     def test_bulk_500_generation(self):
         cases=generate_cases(500,2026)
-        validate_serialized_dataset(serialize_cases(cases),"allowed DB actions",500)
+        validate_serialized_dataset(serialize_cases(cases,500),"allowed DB actions",500)
 
     def test_end_to_end_write(self):
         with tempfile.TemporaryDirectory() as directory:
             output=Path(directory)/"database.txt";cases=run_generation(25,output,17)
-            self.assertEqual(len(cases),25)
+            self.assertEqual(len(cases),plan_dataset_counts(25)["source_count"])
             validate_serialized_dataset(output.read_text(),"allowed DB actions",25)
 
 
