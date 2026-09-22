@@ -8,6 +8,7 @@ from db_data_generator.generate_dataset import (
     allocate_categories, diversity as database_diversity,
     generate_cases as generate_database, plan_dataset_counts, render_case,
 )
+from security_trace_core import find_evidence_gap_events, find_limit_exceedances, limit_exceedance_indices, validate_scope_limits
 from telcosecgen.engine import (
     AUTHORIZED, EVIDENCE_GAP, TELECOM_SCOPE_SEMANTICS, VIOLATION, _event,
     find_scope_violations, generate_dataset, public_case,
@@ -62,6 +63,19 @@ class TelecomScopeReconciliationTests(unittest.TestCase):
     def test_suspicious_side_step_omission_fails(self):
         case = self._case_with("suspicious", "service.state.check")
         self.assertTrue(self._remove_read_and_validate(case, "service.state.check"))
+
+    def test_suspicious_requires_exact_limit_evidence(self):
+        case = copy.deepcopy(next(case for case in self.cases if case["OUTPUT"]["verdict"] == "suspicious"))
+        case["OUTPUT"]["contributing_events"] = []
+        self.assertIn("contributing_events do not match derived evidence", validate_case(case))
+        case = copy.deepcopy(next(case for case in self.cases if case["OUTPUT"]["verdict"] == "suspicious"))
+        case["SCOPE"]["limits"] = {}
+        self.assertIn("suspicious requires scope-limit evidence", validate_case(case))
+
+    def test_inconclusive_rejects_wrong_authorisation(self):
+        case = copy.deepcopy(next(case for case in self.cases if case["OUTPUT"]["verdict"] == "inconclusive"))
+        case["OUTPUT"]["authorised"] = "yes"
+        self.assertIn("inconclusive has invalid authorised value", validate_case(case))
 
     def test_malicious_harmless_pre_violation_omission_fails(self):
         case = copy.deepcopy(next(case for case in self.cases if case["OUTPUT"]["verdict"] == "malicious"))
@@ -139,6 +153,44 @@ class DatabaseNonRegressionTests(unittest.TestCase):
         for index, case in enumerate(self.cases):
             for prior in self.cases[:index]:
                 self.assertGreaterEqual(database_diversity(case, prior), 0.10)
+
+
+class ReviewLimitSemanticsTests(unittest.TestCase):
+    def test_limit_is_strict_and_event_indices_are_deduplicated(self):
+        events=[
+            {"number":1,"event_type":"db.query","target":"customer_records","payload":"rows_scanned=10000"},
+            {"number":2,"event_type":"db.query","target":"customer_records","payload":"rows_scanned=10001;partitions=2"},
+        ]
+        limits={"db.query/customer_records":{"max_rows_scanned":10000}}
+        evidence=find_limit_exceedances(events,limits,payload_key="payload")
+        self.assertEqual(limit_exceedance_indices(evidence),(2,))
+
+    def test_limit_validation_rejects_bad_threshold_and_unknown_metric(self):
+        events=[{"number":1,"event_type":"db.query","target":"customer_records","payload":"rows_scanned=10001"}]
+        common={"allowed_actions":["db.query"],"allowed_targets":["customer_records"],"payload_key":"payload"}
+        self.assertTrue(validate_scope_limits(events,{"db.query/customer_records":{"max_rows_scanned":0}},**common))
+        self.assertTrue(validate_scope_limits(events,{"db.query/customer_records":{"max_samples":100}},**common))
+        self.assertTrue(validate_scope_limits(events,{"db.query/missing":{"max_rows_scanned":100}},**common))
+
+
+class EvidenceGapSemanticsTests(unittest.TestCase):
+    def test_supported_factual_gap_patterns_are_derived(self):
+        events=[
+            {"number":1,"event_type":"ticket.read","target":"approval","payload":"lookup_result=not_found"},
+            {"number":2,"event_type":"ticket.read","target":"order","payload":"lookup_result=unavailable"},
+            {"number":3,"event_type":"role.read","target":"role","payload":"resolution=unresolved"},
+            {"number":4,"event_type":"policy.read","target":"classification","payload":"classification=unknown"},
+            {"number":5,"event_type":"file.read","target":"fragment","payload":"bytes_read=512;expected_bytes=4096;eof=true"},
+            {"number":6,"event_type":"audit.read","target":"fragment","payload":"segments_read=2;segments_expected=4;eof=true"},
+        ]
+        self.assertEqual(find_evidence_gap_events(events,payload_key="payload"),(1,2,3,4,5,6))
+
+    def test_eof_without_a_shortfall_is_not_a_gap(self):
+        events=[
+            {"number":1,"event_type":"file.read","target":"complete","payload":"bytes_read=512;eof=true"},
+            {"number":2,"event_type":"file.read","target":"complete","payload":"bytes_read=4096;expected_bytes=4096;eof=true"},
+        ]
+        self.assertEqual(find_evidence_gap_events(events,payload_key="payload"),())
 
 
 if __name__ == "__main__":

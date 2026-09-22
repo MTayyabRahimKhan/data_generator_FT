@@ -49,6 +49,18 @@ class AdjacencyRecord:
 
 
 @dataclass(frozen=True)
+class LimitExceedance:
+    """One event metric that strictly exceeds a declared review threshold."""
+
+    event_number: int
+    event_type: str
+    target: str
+    metric: str
+    observed: int
+    maximum: int
+
+
+@dataclass(frozen=True)
 class EventSemantics:
     """Deterministic state effect for one event type.
 
@@ -227,6 +239,134 @@ def find_action_scope_violations(
         elif semantics.external_side_effect and target not in writes:
             violations.append(number)
     return violations
+
+
+def _event_facts(event: Any, payload_key: str | None = None) -> dict[str, str]:
+    if payload_key is not None:
+        value = _event_value(event, payload_key)
+    elif isinstance(event, Mapping):
+        value = event.get("payload", event.get("detail", ""))
+    else:
+        value = getattr(event, "detail", getattr(event, "payload", ""))
+    facts: dict[str, str] = {}
+    for field in str(value).split(";"):
+        if "=" not in field:
+            continue
+        name, fact = field.split("=", 1)
+        name, fact = name.strip().lower(), fact.strip().lower()
+        if re.fullmatch(r"[a-z][a-z0-9_]*", name) and fact:
+            facts[name] = fact
+    return facts
+
+
+def _event_measurements(event: Any, payload_key: str | None = None) -> dict[str, int]:
+    return {
+        name: int(value)
+        for name, value in _event_facts(event, payload_key).items()
+        if re.fullmatch(r"-?\d+", value)
+    }
+
+
+def find_evidence_gap_events(events: Sequence[Any], *, payload_key: str | None = None) -> tuple[int, ...]:
+    """Derive events that contain concrete, neutral evidence-gap facts."""
+    found: list[int] = []
+    for event in events:
+        facts = _event_facts(event, payload_key)
+        direct_gap = (
+            facts.get("lookup_result") in {"not_found", "unavailable"}
+            or facts.get("resolution") == "unresolved"
+            or facts.get("classification") == "unknown"
+        )
+        truncated = False
+        if facts.get("eof") == "true":
+            measurements = _event_measurements(event, payload_key)
+            truncated = any(
+                observed in measurements
+                and expected in measurements
+                and measurements[observed] < measurements[expected]
+                for observed, expected in (
+                    ("bytes_read", "expected_bytes"),
+                    ("segments_read", "segments_expected"),
+                )
+            )
+        if direct_gap or truncated:
+            found.append(int(_event_value(event, "number")))
+    return tuple(dict.fromkeys(found))
+
+
+def validate_scope_limits(
+    events: Sequence[Any],
+    limits: Mapping[str, Mapping[str, int]],
+    *,
+    allowed_actions: Iterable[str],
+    allowed_targets: Iterable[str],
+    payload_key: str | None = None,
+) -> list[str]:
+    """Validate the shape and referential integrity of review thresholds."""
+    if not isinstance(limits, Mapping):
+        return ["scope limits must be a mapping"]
+    actions, targets = set(allowed_actions), set(allowed_targets)
+    event_pairs = {
+        (str(_event_value(event, "event_type")), str(_event_value(event, "target")))
+        for event in events
+    }
+    errors: list[str] = []
+    for operation, thresholds in limits.items():
+        if not isinstance(operation, str) or "/" not in operation:
+            errors.append(f"invalid scope limit operation {operation!r}")
+            continue
+        action, target = operation.split("/", 1)
+        if not action or not target or action not in actions or target not in targets or (action, target) not in event_pairs:
+            errors.append(f"unknown scope limit operation {operation!r}")
+        if not isinstance(thresholds, Mapping) or not thresholds:
+            errors.append(f"scope limit {operation!r} must contain thresholds")
+            continue
+        matching = [event for event in events if (_event_value(event, "event_type"), _event_value(event, "target")) == (action, target)]
+        for key, maximum in thresholds.items():
+            if not isinstance(key, str) or not re.fullmatch(r"max_[a-z][a-z0-9_]*", key):
+                errors.append(f"invalid scope limit metric {key!r}")
+                continue
+            if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+                errors.append(f"scope limit {operation}/{key} must be a positive integer")
+                continue
+            metric = key[4:]
+            if matching and not any(metric in _event_measurements(event, payload_key) for event in matching):
+                errors.append(f"scope limit {operation}/{key} has no matching event metric")
+    return errors
+
+
+def find_limit_exceedances(
+    events: Sequence[Any],
+    limits: Mapping[str, Mapping[str, int]],
+    *,
+    payload_key: str | None = None,
+) -> tuple[LimitExceedance, ...]:
+    """Derive review-threshold evidence without treating it as authorization failure."""
+    exceedances: list[LimitExceedance] = []
+    if not isinstance(limits, Mapping):
+        return ()
+    for event in events:
+        number = int(_event_value(event, "number"))
+        event_type = str(_event_value(event, "event_type"))
+        target = str(_event_value(event, "target"))
+        thresholds = limits.get(f"{event_type}/{target}", {})
+        if not isinstance(thresholds, Mapping):
+            continue
+        measurements = _event_measurements(event, payload_key)
+        for key, maximum in thresholds.items():
+            if (
+                isinstance(key, str)
+                and key.startswith("max_")
+                and isinstance(maximum, int)
+                and not isinstance(maximum, bool)
+                and measurements.get(key[4:], maximum) > maximum
+            ):
+                exceedances.append(LimitExceedance(number, event_type, target, key[4:], measurements[key[4:]], maximum))
+    return tuple(exceedances)
+
+
+def limit_exceedance_indices(exceedances: Iterable[LimitExceedance]) -> tuple[int, ...]:
+    return tuple(dict.fromkeys(item.event_number for item in exceedances))
 
 
 def repetition_errors(

@@ -31,6 +31,17 @@ when its true minimum composite distance meets the configured threshold. A final
 all-pairs audit repeats the check before a single output write (serialization
 occurs only after all cases pass).
 
+Both supported domains serialize per-event review thresholds under
+`SCOPE.limits`. A shared metric parser compares `max_<metric>` rules with
+integer event payload values and derives suspicious `contributing_events` from
+strict exceedances. Review thresholds remain separate from action and resource
+authorization checks, so they do not create a `first_deviation`.
+
+Inconclusive evidence is derived separately from neutral event facts such as a
+missing lookup, unresolved role, unknown classification, or a truncated read.
+Those evidence-gap event numbers populate `contributing_events` while
+authorization remains undetermined and `first_deviation` remains `none`.
+
 Counterfactuals are not part of the schema. After generation, the shared ordering
 planner pairs a configurable subset of severe cases with unused benign cases from
 the existing allocation. Internal severity and adjacency metadata are removed

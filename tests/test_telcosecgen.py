@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ from telcosecgen.engine import (
     VERDICTS, allocate_largest_remainder, dataset_cases, generate_dataset,
     load_config, public_case, serialize_dataset, validate_dataset,
 )
+from security_trace_core import find_evidence_gap_events, find_limit_exceedances, limit_exceedance_indices
 
 
 class TelecomGeneratorTests(unittest.TestCase):
@@ -32,7 +34,7 @@ class TelecomGeneratorTests(unittest.TestCase):
     def test_exact_public_keys(self):
         item=public_case(self.cases[0])
         self.assertEqual(list(item),["family_id","MISSION","SCOPE","EVENTS","OUTPUT"])
-        self.assertEqual(list(item["SCOPE"]),["allowed reads","allowed writes","allowed telecom actions","forbidden"])
+        self.assertEqual(list(item["SCOPE"]),["allowed reads","allowed writes","allowed telecom actions","limits","forbidden"])
         self.assertEqual(list(item["OUTPUT"]),["changed","authorised","first_deviation","contributing_events","label","explanation"])
         for forbidden in ("CASE_ID:","CONTEXT:","DOMAIN:","mission_completed:","verdict:","event_type:","payload:"):
             self.assertNotIn(forbidden,self.text)
@@ -67,6 +69,58 @@ class TelecomGeneratorTests(unittest.TestCase):
             explanation=case["OUTPUT"]["explanation"]
             self.assertIn(unusual[0]["event_type"],explanation)
             self.assertIn(unusual[0]["target"],explanation)
+
+    def test_suspicious_records_point_to_scope_limit_evidence(self):
+        for case in (case for case in self.cases if case["OUTPUT"]["verdict"]=="suspicious"):
+            limits=case["SCOPE"]["limits"]
+            evidence=find_limit_exceedances(case["EVENTS"],limits,payload_key="payload")
+            self.assertTrue(limits)
+            self.assertTrue(evidence)
+            self.assertEqual(case["OUTPUT"]["contributing_events"],list(limit_exceedance_indices(evidence)))
+            self.assertEqual(case["OUTPUT"]["first_deviation"],"none")
+            self.assertEqual(case["OUTPUT"]["authorised"],"yes")
+            self.assertIn(f"Events {', '.join(map(str,case['OUTPUT']['contributing_events']))}",case["OUTPUT"]["explanation"])
+            self.assertIn(f"max_{evidence[0].metric}={evidence[0].maximum}",case["OUTPUT"]["explanation"])
+            twin=next(item for item in dataset_cases([case]) if item["OUTPUT"]["verdict"]=="benign")
+            self.assertEqual(twin["SCOPE"]["limits"],limits)
+            self.assertFalse(find_limit_exceedances(twin["EVENTS"],twin["SCOPE"]["limits"],payload_key="payload"))
+            self.assertEqual(twin["OUTPUT"]["contributing_events"],[])
+
+    def test_serialized_scope_contains_nested_and_empty_limits(self):
+        self.assertIn("  limits:\n    ",self.text)
+        self.assertIn("  limits: {}\n",self.text)
+
+    def test_serialized_validator_rejects_missing_suspicious_contributors(self):
+        documents=self.text.rstrip("\n").split("\n---\n")
+        index=next(i for i,document in enumerate(documents) if "  label: suspicious" in document)
+        documents[index]=re.sub(r"  contributing_events: \[[^\]]+\]","  contributing_events: []",documents[index],count=1)
+        with self.assertRaises(ValueError):
+            validate_serialized_dataset("\n---\n".join(documents)+"\n","allowed telecom actions",100)
+
+    def test_inconclusive_records_point_to_evidence_gap_events(self):
+        for case in (case for case in self.cases if case["OUTPUT"]["verdict"]=="inconclusive"):
+            gaps=find_evidence_gap_events(case["EVENTS"],payload_key="payload")
+            self.assertTrue(gaps)
+            self.assertEqual(case["OUTPUT"]["contributing_events"],list(gaps))
+            self.assertEqual(case["OUTPUT"]["authorised"],"undetermined")
+            self.assertEqual(case["OUTPUT"]["first_deviation"],"none")
+            event=case["EVENTS"][gaps[0]-1]
+            self.assertIn(f"event {gaps[0]}",case["OUTPUT"]["explanation"])
+            self.assertIn(event["target"],case["OUTPUT"]["explanation"])
+
+    def test_serialized_validator_rejects_missing_inconclusive_contributors(self):
+        documents=self.text.rstrip("\n").split("\n---\n")
+        index=next(i for i,document in enumerate(documents) if "  label: inconclusive" in document)
+        documents[index]=re.sub(r"  contributing_events: \[[^\]]+\]","  contributing_events: []",documents[index],count=1)
+        with self.assertRaises(ValueError):
+            validate_serialized_dataset("\n---\n".join(documents)+"\n","allowed telecom actions",100)
+
+    def test_serialized_validator_rejects_removed_gap_fact(self):
+        documents=self.text.rstrip("\n").split("\n---\n")
+        index=next(i for i,document in enumerate(documents) if "  label: inconclusive" in document and "lookup_result=not_found" in document)
+        documents[index]=documents[index].replace("lookup_result=not_found","lookup_result=found",1)
+        with self.assertRaises(ValueError):
+            validate_serialized_dataset("\n---\n".join(documents)+"\n","allowed telecom actions",100)
 
     def test_deviation_positions_cover_all_thirds(self):
         buckets=Counter();definite=[c for c in self.cases if c["OUTPUT"]["first_deviation"]!="none"]

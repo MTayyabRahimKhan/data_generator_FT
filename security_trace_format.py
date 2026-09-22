@@ -6,6 +6,11 @@ from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from typing import Any, Iterable, Mapping, Sequence
 
+from security_trace_core import (
+    find_evidence_gap_events, find_limit_exceedances, limit_exceedance_indices,
+    validate_scope_limits,
+)
+
 
 LABELS = frozenset({"benign", "suspicious", "misaligned", "malicious", "inconclusive"})
 TWIN_REQUIRED = frozenset({"suspicious", "misaligned", "malicious"})
@@ -80,6 +85,16 @@ def _contributors_text(values: Sequence[int]) -> str:
     return "[" + ", ".join(str(value) for value in values) + "]"
 
 
+def _render_limits(limits: Mapping[str, Mapping[str, int]]) -> list[str]:
+    if not limits:
+        return ["  limits: {}"]
+    lines = ["  limits:"]
+    for operation, thresholds in limits.items():
+        lines.append(f"    {operation}:")
+        lines.extend(f"      {name}: {value}" for name, value in thresholds.items())
+    return lines
+
+
 def render_item(item: Mapping[str, Any], action_key: str, payload_key: str) -> str:
     scope = item["SCOPE"]
     output = item["OUTPUT"]
@@ -90,9 +105,9 @@ def render_item(item: Mapping[str, Any], action_key: str, payload_key: str) -> s
         f"  allowed reads: {_csv(scope['allowed reads'])}",
         f"  allowed writes: {_csv(scope['allowed writes'])}",
         f"  {action_key}: {_csv(scope[action_key])}",
-        f"  forbidden: {_csv(scope['forbidden'])}",
-        "EVENTS:",
     ]
+    lines.extend(_render_limits(scope["limits"]))
+    lines.extend((f"  forbidden: {_csv(scope['forbidden'])}", "EVENTS:"))
     for event in item["EVENTS"]:
         parts = [f"  {event['number']}", event["event_type"]]
         if event.get("target"):
@@ -161,21 +176,57 @@ def validate_no_label_leakage(mission: str, events: Sequence[Mapping[str, Any]],
 
 def _parse_document(document: str, action_key: str) -> dict[str, Any]:
     lines = document.splitlines()
-    if len(lines) < 16:
+    if len(lines) < 17:
         raise ValueError("serialized item is incomplete")
     fixed = (
         (0, "family_id: "), (1, "MISSION: "), (2, "SCOPE:"),
         (3, "  allowed reads: "), (4, "  allowed writes: "),
-        (5, f"  {action_key}: "), (6, "  forbidden: "), (7, "EVENTS:"),
+        (5, f"  {action_key}: "),
     )
     for index, prefix in fixed:
         if lines[index] != prefix.rstrip() and not lines[index].startswith(prefix):
             raise ValueError(f"serialized key/order mismatch at line {index + 1}: {lines[index]!r}")
+    cursor = 6
+    limits: dict[str, dict[str, int]] = {}
+    if lines[cursor] == "  limits: {}":
+        cursor += 1
+    elif lines[cursor] == "  limits:":
+        cursor += 1
+        while cursor < len(lines) and lines[cursor].startswith("    "):
+            operation_line = lines[cursor]
+            if not operation_line.startswith("    ") or operation_line.startswith("      ") or not operation_line.endswith(":"):
+                raise ValueError(f"invalid serialized limit operation: {operation_line!r}")
+            operation = operation_line[4:-1]
+            if operation in limits:
+                raise ValueError(f"duplicate serialized limit operation: {operation!r}")
+            cursor += 1
+            thresholds: dict[str, int] = {}
+            while cursor < len(lines) and lines[cursor].startswith("      "):
+                threshold_line = lines[cursor][6:]
+                if ": " not in threshold_line:
+                    raise ValueError(f"invalid serialized limit threshold: {lines[cursor]!r}")
+                name, raw_value = threshold_line.split(": ", 1)
+                if name in thresholds or not re.fullmatch(r"-?\d+", raw_value):
+                    raise ValueError(f"invalid serialized limit threshold: {lines[cursor]!r}")
+                thresholds[name] = int(raw_value)
+                cursor += 1
+            if not thresholds:
+                raise ValueError(f"serialized limit operation has no thresholds: {operation!r}")
+            limits[operation] = thresholds
+    else:
+        raise ValueError("serialized SCOPE must contain limits")
+    if cursor >= len(lines) or not lines[cursor].startswith("  forbidden: "):
+        raise ValueError("serialized SCOPE must contain forbidden after limits")
+    forbidden_line = lines[cursor]
+    cursor += 1
+    if cursor >= len(lines) or lines[cursor] != "EVENTS:":
+        raise ValueError("serialized SCOPE must be followed by EVENTS")
+    events_index = cursor
     try:
-        output_index = lines.index("OUTPUT:", 8)
+        output_index = lines.index("OUTPUT:", events_index + 1)
     except ValueError as exc:
         raise ValueError("missing OUTPUT section") from exc
-    event_lines = lines[8:output_index]
+    event_lines = lines[events_index + 1:output_index]
     events = []
     for expected, line in enumerate(event_lines, 1):
         match = EVENT_RE.fullmatch(line)
@@ -206,15 +257,25 @@ def _parse_document(document: str, action_key: str) -> dict[str, Any]:
     matches = leakage_matches(lines[1][len("MISSION: "):] + "\n" + event_text)
     if matches:
         raise ValueError(f"serialized answer-bearing text: {matches[0]!r}")
-    forbidden = lines[6][len("  forbidden: "):]
+    forbidden = forbidden_line[len("  forbidden: "):]
     return {
         "family_id": family,
         "mission": lines[1][len("MISSION: "):],
         "events": events,
         "event_lines": event_lines,
+        "allowed_reads": tuple(part.strip() for part in lines[3][len("  allowed reads: "):].split(",") if part.strip()),
+        "allowed_writes": tuple(part.strip() for part in lines[4][len("  allowed writes: "):].split(",") if part.strip()),
+        "allowed_actions": tuple(part.strip() for part in lines[5][len(f"  {action_key}: "):].split(",") if part.strip()),
+        "limits": limits,
         "forbidden": tuple(part.strip() for part in forbidden.split(",") if part.strip()),
         **values,
     }
+
+
+def _parsed_contributors(value: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"\[(?:\d+(?:, \d+)*)?\]", value):
+        raise ValueError(f"invalid contributing_events value: {value!r}")
+    return tuple(int(part) for part in value[1:-1].split(", ") if part)
 
 
 def validate_serialized_dataset(
@@ -241,6 +302,8 @@ def validate_serialized_dataset(
                 raise ValueError(f"{family} benign twin must follow its source")
             if members[0]["mission"] != members[1]["mission"]:
                 raise ValueError(f"{family} twin mission differs")
+            if members[0]["limits"] != members[1]["limits"]:
+                raise ValueError(f"{family} twin limits differ")
             left = [(event["kind"], event["target"]) for event in members[0]["events"]]
             right = [(event["kind"], event["target"]) for event in members[1]["events"]]
             if left != right:
@@ -249,6 +312,42 @@ def validate_serialized_dataset(
                 raise ValueError(f"{family} has invalid benign twin output")
         elif len(members) != 1 or labels[0] not in {"benign", "inconclusive"}:
             raise ValueError(f"{family} has invalid standalone membership")
+
+    for members in families.values():
+        for member in members:
+            events = [
+                {"number": int(event["number"]), "event_type": event["kind"], "target": event["target"] or "", "payload": event["payload"] or ""}
+                for event in member["events"]
+            ]
+            limit_errors = validate_scope_limits(
+                events,
+                member["limits"],
+                allowed_actions=member["allowed_actions"],
+                allowed_targets=(*member["allowed_reads"], *member["allowed_writes"]),
+                payload_key="payload",
+            )
+            if limit_errors:
+                raise ValueError(limit_errors[0])
+            exceedances = find_limit_exceedances(events, member["limits"], payload_key="payload")
+            gap_events = find_evidence_gap_events(events, payload_key="payload")
+            contributors = _parsed_contributors(member["contributing_events"])
+            if member["label"] == "suspicious":
+                expected = limit_exceedance_indices(exceedances)
+                if not member["limits"] or not expected or contributors != expected:
+                    raise ValueError(f"{member['family_id']} suspicious contributors do not match scope-limit evidence")
+                if member["authorised"] != "yes" or member["first_deviation"] != "none":
+                    raise ValueError(f"{member['family_id']} has invalid suspicious authorization semantics")
+            elif exceedances:
+                raise ValueError(f"{member['family_id']} non-suspicious item has threshold evidence")
+            if member["label"] == "inconclusive":
+                if not gap_events or contributors != gap_events:
+                    raise ValueError(f"{member['family_id']} inconclusive contributors do not match evidence-gap events")
+                if member["authorised"] != "undetermined" or member["first_deviation"] != "none":
+                    raise ValueError(f"{member['family_id']} has invalid inconclusive authorization semantics")
+            elif gap_events:
+                raise ValueError(f"{member['family_id']} non-inconclusive item has evidence-gap facts")
+            if member["label"] == "benign" and contributors:
+                raise ValueError(f"{member['family_id']} benign item has contributing events")
 
     representatives = [members[0] for members in families.values()]
     validate_mission_similarity(

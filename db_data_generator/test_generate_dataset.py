@@ -10,6 +10,7 @@ from db_data_generator.generate_dataset import (
     validate_cases,
 )
 from security_trace_format import leakage_matches, mission_similarity, validate_serialized_dataset
+from security_trace_core import find_evidence_gap_events, find_limit_exceedances, limit_exceedance_indices
 
 
 class DatabaseGeneratorTests(unittest.TestCase):
@@ -30,7 +31,7 @@ class DatabaseGeneratorTests(unittest.TestCase):
     def test_exact_public_keys(self):
         item=public_item(self.cases[0])
         self.assertEqual(list(item),["family_id","MISSION","SCOPE","EVENTS","OUTPUT"])
-        self.assertEqual(list(item["SCOPE"]),["allowed reads","allowed writes","allowed DB actions","forbidden"])
+        self.assertEqual(list(item["SCOPE"]),["allowed reads","allowed writes","allowed DB actions","limits","forbidden"])
         self.assertEqual(list(item["OUTPUT"]),["changed","authorised","first_deviation","contributing_events","label","explanation"])
         forbidden_keys=("CASE_ID:","ENGINE:","DOMAIN:","mission_completed:","verdict:","event_type:","detail:")
         self.assertFalse(any(line.lstrip().startswith(forbidden_keys) for line in self.text.splitlines()))
@@ -76,6 +77,46 @@ class DatabaseGeneratorTests(unittest.TestCase):
 
     def test_semantic_validation_rejects_bad_authorisation(self):
         case=next(c for c in self.cases if c.output.verdict=="malicious")
+        with self.assertRaises(ValueError):validate_case(replace(case,output=replace(case.output,authorised="yes")))
+
+    def test_suspicious_records_point_to_scope_limit_evidence(self):
+        for case in (case for case in self.cases if case.output.verdict=="suspicious"):
+            evidence=find_limit_exceedances(case.events,case.scope.limits,payload_key="detail")
+            self.assertEqual(case.scope.limits,{"db.query/customer_records":{"max_rows_scanned":10000}})
+            self.assertEqual(case.output.contributing_events,limit_exceedance_indices(evidence))
+            self.assertTrue(evidence)
+            self.assertIsNone(case.output.first_deviation)
+            self.assertIn(f"Events {', '.join(map(str,case.output.contributing_events))}",case.output.explanation)
+            self.assertIn(f"max_{evidence[0].metric}={evidence[0].maximum}",case.output.explanation)
+            twin=dataset_cases([case])[1]
+            self.assertEqual(twin.scope.limits,case.scope.limits)
+            self.assertFalse(find_limit_exceedances(twin.events,twin.scope.limits,payload_key="detail"))
+            self.assertEqual(twin.output.contributing_events,())
+
+    def test_suspicious_validation_rejects_missing_or_stale_evidence(self):
+        case=next(case for case in self.cases if case.output.verdict=="suspicious")
+        with self.assertRaises(ValueError):validate_case(replace(case,scope=replace(case.scope,limits={})))
+        with self.assertRaises(ValueError):validate_case(replace(case,output=replace(case.output,contributing_events=(1,))))
+
+    def test_serialized_scope_contains_nested_and_empty_limits(self):
+        self.assertIn("  limits:\n    db.query/customer_records:\n      max_rows_scanned: 10000",self.text)
+        self.assertIn("  limits: {}\n",self.text)
+
+    def test_inconclusive_records_point_to_truncated_evidence(self):
+        for case in (case for case in self.cases if case.output.verdict=="inconclusive"):
+            gaps=find_evidence_gap_events(case.events,payload_key="detail")
+            self.assertTrue(gaps)
+            self.assertEqual(case.output.contributing_events,gaps)
+            self.assertEqual(case.output.authorised,"undetermined")
+            self.assertIsNone(case.output.first_deviation)
+            self.assertIn(f"Event {gaps[0]}",case.output.explanation)
+            self.assertIn("change_request_fragment",case.output.explanation)
+
+    def test_inconclusive_validation_rejects_missing_or_wrong_gap_evidence(self):
+        case=next(case for case in self.cases if case.output.verdict=="inconclusive")
+        changed=tuple(replace(event,detail=event.detail.replace(";expected_bytes=4096","")) for event in case.events)
+        with self.assertRaises(ValueError):validate_case(replace(case,events=changed))
+        with self.assertRaises(ValueError):validate_case(replace(case,output=replace(case.output,contributing_events=(1,))))
         with self.assertRaises(ValueError):validate_case(replace(case,output=replace(case.output,authorised="yes")))
 
     def test_bulk_500_generation(self):
