@@ -6,9 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-import yaml
-
-from .engine import CONTEXTS, VERDICTS, GenerationError, generate_dataset, load_config, public_case
+from .engine import CONTEXTS, VERDICTS, GenerationError, generate_dataset, load_config, serialize_dataset
 
 
 def positive_integer(value: str) -> int:
@@ -39,23 +37,32 @@ def main(argv: list[str] | None = None) -> int:
         cases, plan = generate_dataset(args.cases, args.seed, config)
         destination = args.output.resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        rendered = yaml.safe_dump_all([public_case(case) for case in cases], sort_keys=False, explicit_start=False, allow_unicode=True)
+        rendered = serialize_dataset(cases)
         destination.write_text(rendered, encoding="utf-8")
-    except (GenerationError, OSError) as exc:
+    except (GenerationError, ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print("Generation complete")
     print(f"Primary cases: {args.cases}")
     for verdict in VERDICTS:
         print(f"{verdict.title()}: {plan['verdicts'][verdict]}")
-    print(f"Selective adjacencies: {plan['adjacency']['selected']}")
-    print(f"Benign before severe: {plan['adjacency']['before']}")
-    print(f"Benign after severe: {plan['adjacency']['after']}")
+    print(f"Benign twins: {plan['adjacency']['selected']}")
+    print(f"Serialized items: {len(cases) + plan['adjacency']['selected']}")
     print(f"Mission completed: {plan['outcomes']['completed']}")
     print(f"Mission failed: {plan['outcomes']['failed']}")
     for context in CONTEXTS:
         print(f"{context}: {plan['contexts'][context]}")
-    print("Pairwise diversity >= 0.10: passed")
+    audit = plan["diversity"]
+    print(f"Exact normalized duplicates: {audit['exact_normalized_duplicates']}")
+    print(f"Pairs checked: {audit['pairs_checked']}")
+    print(f"Pairs below threshold: {audit['pairs_below_threshold']}")
+    print(f"Minimum pairwise distance: {audit['minimum_pairwise_distance']:.6f}")
+    print(f"Closest pair: {audit['closest_pair']}")
+    print(f"Largest mission-template cluster: {audit['largest_mission_template_cluster']}")
+    print(f"Event-order duplicate groups: {audit['event_order_duplicate_groups']}")
+    print(f"Unique allowed-role profiles: {audit['unique_allowed_role_profiles']}")
+    print(f"Unique forbidden-role profiles: {audit['unique_forbidden_role_profiles']}")
+    print(f"Pairwise diversity >= {config['diversity']['minimum_pairwise_distance']:.2f}: passed")
     print("Validation: passed")
     print(f"Output: {destination}")
     if args.cases < len(VERDICTS):

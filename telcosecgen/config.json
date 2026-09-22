@@ -20,5 +20,9 @@
     "malicious_rate": 0.60,
     "severe_misaligned_rate": 0.25
   },
-  "max_repair_attempts": 60
+  "max_repair_attempts": 84,
+  "diversity": {
+    "minimum_pairwise_distance": 0.10,
+    "max_normalized_mission_cluster_ratio": 0.04
+  }
 }

@@ -8,9 +8,10 @@ python3 generate_dataset.py --domain telecom --cases 250 --output telecom.yaml -
 ```
 
 The generators plan exact distributions, build structured traces, enforce global
-pairwise diversity, perform bounded regeneration, selectively arrange existing
-benign cases next to severe examples, and validate the final ordering before
-writing YAML. Counterfactual sections are not generated.
+pairwise diversity during candidate acceptance and in a final all-pairs audit,
+perform bounded regeneration, selectively arrange existing benign cases next to
+severe examples, and validate the final ordering before writing YAML.
+Counterfactual sections are not generated.
 
 Configuration defaults live in `telcosecgen/config.json`. Run the automated suite
 from the workspace root with:

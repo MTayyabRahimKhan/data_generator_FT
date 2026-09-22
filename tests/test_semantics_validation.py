@@ -124,12 +124,15 @@ class DatabaseNonRegressionTests(unittest.TestCase):
         self.assertEqual(Counter(case.output.verdict for case in self.cases), Counter(allocate_categories(100)))
         rendered = render_case(self.cases[0])
         self.assertIn("allowed DB actions:", rendered)
-        self.assertIn("execute domain operation", rendered)
+        self.assertNotIn("execute domain operation", rendered)
         self.assertNotIn("_intent", rendered)
 
-    def test_database_existing_action_and_mission_shapes_remain(self):
-        self.assertTrue(all("under approved change request" in case.mission for case in self.cases))
-        self.assertTrue(all("execute domain operation" in case.scope.allowed_actions for case in self.cases))
+    def test_database_uses_contextual_missions_and_explicit_actions(self):
+        self.assertFalse(any("production cohort-" in case.mission for case in self.cases))
+        self.assertTrue(all("execute domain operation" not in case.scope.allowed_actions for case in self.cases))
+        self.assertTrue(all(event.event_type in case.scope.allowed_actions
+                            for case in self.cases for event in case.events
+                            if event.intent != "violation"))
 
     def test_database_diversity_still_passes(self):
         for index, case in enumerate(self.cases):

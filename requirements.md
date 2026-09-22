@@ -43,6 +43,35 @@ distance uses normalized positional difference. Synthetic IDs are normalized so
 that changing an identifier alone does not manufacture diversity. The full
 dataset is checked pairwise again before serialization.
 
+For Database datasets, every candidate is compared online with every accepted
+fingerprint. Rejected blueprints are diversified in a fixed escalation order:
+event ordering, side steps, role profiles, trigger, origin, resource profile,
+then mission template. Generation succeeds only when exactly `N` accepted cases
+pass the final all-pairs audit. The default minimum is configurable as
+`minimum_pairwise_distance: 0.10`.
+
+Database missions are planned from independent origin, trigger, objective,
+environment, risk-window, engine, domain, role, ordering, and resource
+dimensions. At 100 or more cases, a mission template family is capped at 5% by
+default. Normalized mission and explanation prose is audited for excessive
+reuse.
+
+## Database event semantics
+
+Database `changed` entries are derived from a deterministic event-state
+registry and the source event number. Read-only plan analysis, query profiling,
+catalog inspection, backup verification, and restore verification never appear
+as changes. Persisted statistics refreshes, schema/data/role mutations, imports,
+and external exports do. A later rollback annotates reversible attempted
+changes without erasing irreversible or external effects.
+
+Allowed Database actions are exact event types. Each authorized event must also
+name an allowed read or write target according to its semantics; intentional
+violations are never added to scope. First deviation and contributing events
+are recomputed from action, resource, forbidden-target, and role checks.
+Mechanical event cycles and excessive identical signatures are rejected using
+configurable limits.
+
 ## Selective severe-case adjacency
 
 Adjacency is an ordering constraint applied only after exactly `N` valid, diverse

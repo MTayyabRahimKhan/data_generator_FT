@@ -12,9 +12,16 @@ generated. Selected severe cases may be placed next to an existing benign case.
 
 The generator deterministically apportions the five verdicts at
 35/20/20/15/10, the five engines evenly, and mission outcomes near 95/5. It then
-plans blueprints, expands engine-aware traces, applies selective adjacency,
-validates structure and semantics, enforces global diversity, retries invalid
-batches, and writes YAML-compatible multi-document output separated by `---`.
+plans multi-dimensional blueprints, expands engine-aware traces, derives state
+changes and authorization findings from a deterministic event registry, applies
+selective adjacency, and writes YAML-compatible multi-document output separated
+by `---`.
+
+Each candidate is validated against every accepted fingerprint at the configured
+minimum pairwise distance (default `0.10`). Before output, all pairs are audited
+again: 500 cases means 124,750 comparisons and 1,000 cases means 499,500.
+Mission-template families are capped at 5% for datasets of at least 100 cases;
+event-cycle and explanation-reuse checks are also configurable.
 
 Configuration and policy percentages live in `generator_config.json`. Invalid,
 zero, negative, and non-integer case counts are rejected.

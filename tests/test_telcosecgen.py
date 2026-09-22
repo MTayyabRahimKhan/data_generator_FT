@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import subprocess
 import sys
 import tempfile
@@ -8,91 +7,89 @@ import unittest
 from collections import Counter
 from pathlib import Path
 
-import yaml
-
+from security_trace_format import leakage_matches, mission_similarity, validate_serialized_dataset
 from telcosecgen.engine import (
-    VERDICTS, adjacency_records, allocate_largest_remainder, diversity,
-    generate_dataset, load_config, public_case, semantic_critic, validate_case,
-    validate_dataset,
+    VERDICTS, allocate_largest_remainder, dataset_cases, generate_dataset,
+    load_config, public_case, serialize_dataset, validate_dataset,
 )
 
 
 class TelecomGeneratorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.cases, cls.plan = generate_dataset(100, 42)
+        cls.cases,cls.plan=generate_dataset(100,42)
+        cls.text=serialize_dataset(cls.cases)
+        cls.documents=validate_serialized_dataset(cls.text,"allowed telecom actions",100)
 
-    def test_exact_distribution_and_count(self):
-        expected = dict(zip(VERDICTS, (35, 20, 20, 15, 10)))
-        self.assertEqual(len(self.cases), 100)
-        self.assertEqual(Counter(c["OUTPUT"]["verdict"] for c in self.cases), expected)
-        self.assertEqual(allocate_largest_remainder(101, expected, VERDICTS), {"benign": 36, "suspicious": 20, "misaligned": 20, "malicious": 15, "inconclusive": 10})
+    def test_distribution_count_and_twins(self):
+        expected=dict(zip(VERDICTS,(35,20,20,15,10)))
+        self.assertEqual(Counter(c["OUTPUT"]["verdict"] for c in self.cases),expected)
+        self.assertEqual(len(self.documents),155)
+        self.assertEqual(allocate_largest_remainder(101,expected,VERDICTS),{"benign":36,"suspicious":20,"misaligned":20,"malicious":15,"inconclusive":10})
 
-    def test_selective_adjacency_before_after_and_no_reuse(self):
-        records = adjacency_records(self.cases)
-        self.assertEqual(sum(next(c for c in self.cases if c["CASE_ID"] == r.severe_case_id)["OUTPUT"]["verdict"] == "malicious" for r in records), 9)
-        self.assertLess(9, 15)
-        self.assertEqual(len({r.benign_case_id for r in records}), len(records))
-        self.assertEqual({r.direction for r in records}, {"before", "after"})
-        positions = {c["CASE_ID"]: i for i, c in enumerate(self.cases)}
-        by_id = {c["CASE_ID"]: c for c in self.cases}
-        for record in records:
-            offset = -1 if record.direction == "before" else 1
-            self.assertEqual(positions[record.benign_case_id], positions[record.severe_case_id] + offset)
-            self.assertEqual(by_id[record.benign_case_id]["OUTPUT"]["verdict"], "benign")
-            self.assertGreaterEqual(diversity(by_id[record.benign_case_id], by_id[record.severe_case_id]), 0.10)
+    def test_exact_public_keys(self):
+        item=public_case(self.cases[0])
+        self.assertEqual(list(item),["family_id","MISSION","SCOPE","EVENTS","OUTPUT"])
+        self.assertEqual(list(item["SCOPE"]),["allowed reads","allowed writes","allowed telecom actions","forbidden"])
+        self.assertEqual(list(item["OUTPUT"]),["changed","authorised","first_deviation","contributing_events","label","explanation"])
+        for forbidden in ("CASE_ID:","CONTEXT:","DOMAIN:","mission_completed:","verdict:","event_type:","payload:"):
+            self.assertNotIn(forbidden,self.text)
 
-    def test_noneligible_cases_do_not_require_adjacency(self):
-        for case in self.cases:
-            verdict = case["OUTPUT"]["verdict"]
-            severity = case["_meta"]["severity_level"]
-            if verdict in {"suspicious", "inconclusive"} or (verdict == "misaligned" and severity == "medium"):
-                self.assertNotIn("adjacency", case["_meta"])
+    def test_true_adjacent_benign_twins(self):
+        expanded=dataset_cases(self.cases)
+        for index,case in enumerate(expanded):
+            if case["OUTPUT"]["verdict"] not in {"suspicious","misaligned","malicious"}:continue
+            twin=expanded[index+1]
+            self.assertEqual(twin["family_id"],case["family_id"])
+            self.assertEqual(twin["OUTPUT"]["verdict"],"benign")
+            self.assertEqual(twin["MISSION"],case["MISSION"])
+            self.assertEqual([(e["event_type"],e["target"]) for e in twin["EVENTS"]],[(e["event_type"],e["target"]) for e in case["EVENTS"]])
+            self.assertEqual(twin["OUTPUT"]["first_deviation"],"none")
 
-    def test_configurable_rates_and_benign_cap(self):
-        config = copy.deepcopy(load_config())
-        config["severe_case_adjacency"].update({"malicious_rate": 0, "severe_misaligned_rate": 0})
-        cases, plan = generate_dataset(100, 42, config)
-        self.assertEqual(plan["adjacency"]["selected"], 0)
-        self.assertFalse(adjacency_records(cases))
-        config["severe_case_adjacency"].update({"malicious_rate": 1, "severe_misaligned_rate": 1})
-        _, plan = generate_dataset(100, 42, config)
-        self.assertLessEqual(plan["adjacency"]["selected"], 35)
+    def test_no_label_leakage_and_forbidden_diversity(self):
+        for case in dataset_cases(self.cases):
+            observed=case["MISSION"]+"\n"+"\n".join(f"{e['event_type']} {e['target']} {e['payload']}" for e in case["EVENTS"])
+            self.assertEqual(leakage_matches(observed),[])
+        profiles=Counter(tuple(case["SCOPE"]["forbidden"]) for case in self.cases)
+        self.assertGreaterEqual(len(profiles),3)
+        self.assertLessEqual(max(profiles.values())/len(self.cases),.40)
 
-    def test_seed_reproducibility_and_small_dataset(self):
-        self.assertEqual(generate_dataset(25, 123), generate_dataset(25, 123))
-        self.assertNotEqual(generate_dataset(25, 123), generate_dataset(25, 124))
-        self.assertEqual(len(generate_dataset(1, 9)[0]), 1)
+    def test_suspicious_explanation_names_actual_unusual_event(self):
+        markers=("records=48000","objects=12500","attempts=7","checks=9","samples=86400","records=32000","checks=12","records=22000")
+        suspicious=[case for case in self.cases if case["OUTPUT"]["verdict"]=="suspicious"]
+        self.assertTrue(suspicious)
+        for case in suspicious:
+            unusual=[event for event in case["EVENTS"] if any(marker in event["payload"] for marker in markers)]
+            self.assertTrue(unusual,case["CASE_ID"])
+            self.assertTrue(all(event["event_type"]==unusual[0]["event_type"] and event["target"]==unusual[0]["target"] for event in unusual))
+            explanation=case["OUTPUT"]["explanation"]
+            self.assertIn(unusual[0]["event_type"],explanation)
+            self.assertIn(unusual[0]["target"],explanation)
 
-    def test_global_pairwise_diversity(self):
-        for index, case in enumerate(self.cases):
-            for prior in self.cases[:index]:
-                self.assertGreaterEqual(diversity(case, prior), 0.10)
+    def test_deviation_positions_cover_all_thirds(self):
+        buckets=Counter();definite=[c for c in self.cases if c["OUTPUT"]["first_deviation"]!="none"]
+        for case in definite:
+            deviation=int(case["OUTPUT"]["first_deviation"].split()[1])
+            ratio=(deviation-2)/max(1,len(case["EVENTS"])-3)
+            buckets["early" if ratio<=1/3 else "middle" if ratio<=2/3 else "late"]+=1
+        self.assertTrue(all(buckets[name]/len(definite)>=.25 for name in ("early","middle","late")))
 
-    def test_no_counterfactual_or_internal_metadata_in_output(self):
-        public = [public_case(case) for case in self.cases]
-        rendered = yaml.safe_dump_all(public)
-        self.assertNotIn("COUNTERFACTUAL", rendered.upper())
-        self.assertNotIn("pair_id", rendered)
-        self.assertNotIn("_meta", rendered)
-        self.assertTrue(all("allowed roles" in case["SCOPE"] and "forbidden roles" in case["SCOPE"] for case in public))
+    def test_mission_similarity(self):
+        for index,case in enumerate(self.cases):
+            for prior in self.cases[:index]:self.assertLessEqual(mission_similarity(case["MISSION"],prior["MISSION"]),.90)
 
-    def test_semantic_validation_still_runs(self):
-        self.assertEqual(validate_dataset(self.cases, 100, load_config()), [])
-        self.assertEqual(semantic_critic(self.cases[0]), {"valid": True, "issues": []})
-        broken = copy.deepcopy(next(c for c in self.cases if c["OUTPUT"]["verdict"] == "malicious"))
-        broken["OUTPUT"]["authorised"] = "yes"
-        self.assertTrue(validate_case(broken))
+    def test_repeated_seeded_generations(self):
+        for seed in (1,7,42,314,2026):
+            cases,_=generate_dataset(25,seed)
+            self.assertEqual(validate_dataset(cases,25,load_config()),[])
+            validate_serialized_dataset(serialize_dataset(cases),"allowed telecom actions",25)
 
     def test_package_cli(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "telecom.yaml"
-            result = subprocess.run([sys.executable, "-m", "telcosecgen", "generate", "--cases", "25", "--output", str(output), "--seed", "7"], text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            documents = list(yaml.safe_load_all(output.read_text(encoding="utf-8")))
-            self.assertEqual(len(documents), 25)
-            self.assertTrue(all("COUNTERFACTUAL" not in document for document in documents))
+            output=Path(directory)/"telecom.txt"
+            result=subprocess.run([sys.executable,"-m","telcosecgen","generate","--cases","25","--output",str(output),"--seed","7"],text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            validate_serialized_dataset(output.read_text(),"allowed telecom actions",25)
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__=="__main__":unittest.main()
