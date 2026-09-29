@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import re
+import math
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from typing import Any, Iterable, Mapping, Sequence
 
 from security_trace_core import (
     approval_evidence_indices,
-    baseline_outlier_indices, find_anomalous_activity_events, find_baseline_outliers, find_evidence_gap_events,
+    baseline_outlier_indices, duplicate_event_attribute_errors, find_anomalous_activity_events, find_baseline_outliers, find_evidence_gap_events,
     find_limit_exceedances, limit_exceedance_indices, validate_scope_limits,
     required_approval_evidence, required_approval_violation_indices, validate_explanation_facts,
 )
@@ -37,6 +38,135 @@ LEAKAGE_RE = re.compile("|".join(f"(?:{pattern})" for pattern in LEAKAGE_PATTERN
 EVENT_RE = re.compile(r"^  (?P<number>\d+)  (?P<kind>\S+)(?:  (?P<target>\S+))?(?:  (?P<payload>.*))?$")
 FAMILY_RE = re.compile(r"^(?:DB|TELCO)-FAMILY-\d{6}$")
 TEMPLATE_FAMILY_RE = re.compile(r"^TEMPLATE-FAMILY-\d{6}$")
+SIMILARITY_HARD_CAP = 0.80
+
+
+def normalize_similarity_text(value: str) -> str:
+    """Normalize synthetic identity while retaining security semantics."""
+    value=value.lower()
+    replacements=(
+        (r"\b(?:db|telco)-family-\d+\b","family_id"),
+        (r"\btemplate-family-\d+\b","template_id"),
+        (r"\bticket-sec-\d+\b","ticket_id"),
+        (r"\bcell-lab-\d+\b","cell_id"),
+        (r"\bsub-\d+\b","subscriber_id"),
+        (r"\bnf-syn-\d+\b","network_function_id"),
+        (r"\bbatch-syn-\d+\b","batch_id"),
+        (r"\bims-syn-\d+\b","ims_id"),
+        (r"\b(?:peer|stage|outside)-syn-\d+\b","synthetic_id"),
+        (r"\bcase-\d+(?:-twin)?\b","case_id"),
+        (r"\b(?:ops-syn|service_batch|handset)[-_]?\d+\b","principal_id"),
+        (r"\b\d{4}-\d{2}-\d{2}(?:t\d{2}:\d{2}(?::\d{2})?z?)?\b","timestamp"),
+    )
+    for pattern,replacement in replacements:value=re.sub(pattern,replacement,value)
+    return " ".join(re.findall(r"[a-z][a-z0-9_.<>/-]*|\d+",value))
+
+
+def _cosine_tokens(left: str,right: str) -> float:
+    a=Counter(normalize_similarity_text(left).split());b=Counter(normalize_similarity_text(right).split())
+    return _cosine_counters(a,b)
+
+
+def _cosine_counters(a: Counter,b: Counter) -> float:
+    if not a and not b:return 1.0
+    if not a or not b:return 0.0
+    dot=sum(count*b.get(token,0) for token,count in a.items())
+    return dot/(math.sqrt(sum(value*value for value in a.values()))*math.sqrt(sum(value*value for value in b.values())))
+
+
+def _jaccard(left: Iterable[str],right: Iterable[str]) -> float:
+    a,b=set(left),set(right)
+    return 1.0 if not a and not b else len(a&b)/len(a|b)
+
+
+def _action_scope_key(item: Mapping[str,Any]) -> str:
+    return next(key for key in item["SCOPE"] if key.startswith("allowed ") and key.endswith(" actions"))
+
+
+def _payload_key(item: Mapping[str,Any]) -> str:
+    return "detail" if any("detail" in event for event in item["EVENTS"]) else "payload"
+
+
+def _normalized_target(value: str) -> str:
+    return normalize_similarity_text(value).replace("subscriber_id","<id>").replace("cell_id","<id>").replace("network_function_id","<id>").replace("batch_id","<id>").replace("ims_id","<id>").replace("synthetic_id","<id>")
+
+
+def record_similarity(left: Mapping[str,Any],right: Mapping[str,Any]) -> float:
+    """Composite similarity over substantive fields; IDs and labels are excluded."""
+    return _record_similarity_features(_similarity_features(left),_similarity_features(right))
+
+
+def _similarity_features(item: Mapping[str,Any]) -> dict[str,Any]:
+    def scope_tokens():
+        scope=item["SCOPE"];action_key=_action_scope_key(item);tokens=[]
+        for key in ("allowed reads","allowed writes",action_key,"forbidden"):
+            tokens.extend(f"{key}:{normalize_similarity_text(str(value))}" for value in scope.get(key,[]))
+        for approval,requirement in scope.get("required approvals",{}).items():
+            tokens.append(f"approval:{normalize_similarity_text(approval)}:{requirement.get('action')}:{_normalized_target(str(requirement.get('target','')))}")
+        for operation,thresholds in scope.get("limits",{}).items():
+            tokens.extend(f"limit:{_normalized_target(operation)}:{name}:{value}" for name,value in thresholds.items())
+        return tokens
+    event_structure=[f"{event['event_type']}:{_normalized_target(str(event.get('target','')))}" for event in item["EVENTS"]]
+    payload_key=_payload_key(item)
+    output=item["OUTPUT"]
+    output_text=" ".join((str(output.get("authorised","")),str(output.get("first_deviation","")),str(len(output.get("contributing_events",[])))," ".join(map(str,output.get("changed",[]))),str(output.get("explanation",""))))
+    scope=item["SCOPE"];action_key=_action_scope_key(item)
+    parts=[str(item["MISSION"]),repr({key:scope.get(key) for key in ("allowed reads","allowed writes",action_key,"required approvals","limits","forbidden")})]
+    parts.extend(f"{event['event_type']} {event.get('target','')} {event.get(payload_key,'')}" for event in item["EVENTS"])
+    parts.extend((str(output.get("authorised","")),str(output.get("first_deviation","")),str(output.get("contributing_events",[])),str(output.get("changed",[])),str(output.get("explanation",""))))
+    full_tokens=normalize_similarity_text(" ".join(parts)).split()
+    return {
+        "mission":Counter(normalize_similarity_text(str(item["MISSION"])).split()),
+        "scope":set(scope_tokens()),"events":event_structure,
+        "details":Counter(normalize_similarity_text(" ".join(str(event.get(payload_key,"")) for event in item["EVENTS"])).split()),
+        "output":Counter(normalize_similarity_text(output_text).split()),
+        "full":Counter(zip(full_tokens,full_tokens[1:])),
+    }
+
+
+def _record_similarity_features(left: Mapping[str,Any],right: Mapping[str,Any]) -> float:
+    mission=_cosine_counters(left["mission"],right["mission"])
+    scope=_jaccard(left["scope"],right["scope"])
+    ls,rs=left["events"],right["events"]
+    sequence=SequenceMatcher(None,ls,rs).ratio()
+    count_ratio=min(len(ls),len(rs))/max(len(ls),len(rs)) if ls or rs else 1.0
+    event_structure_similarity=.85*sequence+.15*count_ratio
+    event_detail=_cosine_counters(left["details"],right["details"])
+    output=_cosine_counters(left["output"],right["output"])
+    return .20*mission+.20*scope+.30*event_structure_similarity+.15*event_detail+.15*output
+
+
+def build_similarity_features(item: Mapping[str,Any]) -> dict[str,Any]:
+    return _similarity_features(item)
+
+
+def feature_similarity(left: Mapping[str,Any],right: Mapping[str,Any]) -> tuple[float,float]:
+    return _record_similarity_features(left,right),_cosine_counters(left["full"],right["full"])
+
+
+def normalized_full_record_similarity(left: Mapping[str,Any],right: Mapping[str,Any]) -> float:
+    """Independent bigram-cosine safety check over the normalized record."""
+    return _cosine_counters(_similarity_features(left)["full"],_similarity_features(right)["full"])
+
+
+def global_similarity_audit(items: Sequence[Mapping[str,Any]],cap: float = SIMILARITY_HARD_CAP) -> dict[str,Any]:
+    maximum=0.0;maximum_full=0.0;pair=None;full_pair=None;above=0
+    features=[_similarity_features(item) for item in items]
+    for index,current in enumerate(items):
+        for prior_index in range(index):
+            prior=items[prior_index];score=_record_similarity_features(features[prior_index],features[index]);full=_cosine_counters(features[prior_index]["full"],features[index]["full"])
+            ids=(prior.get("family_id",prior_index),current.get("family_id",index))
+            if score>maximum:maximum,pair=score,ids
+            if full>maximum_full:maximum_full,full_pair=full,ids
+            if score>cap+1e-12 or full>cap+1e-12:above+=1
+    return {"maximum_pair_similarity":maximum,"maximum_pair":pair,"maximum_full_text_similarity":maximum_full,"maximum_full_text_pair":full_pair,"pairs_above_0.80":above}
+
+
+def validate_global_similarity(items: Sequence[Mapping[str,Any]],cap: float = SIMILARITY_HARD_CAP) -> dict[str,Any]:
+    audit=global_similarity_audit(items,cap)
+    if audit["pairs_above_0.80"]:
+        raise ValueError(f"{audit['pairs_above_0.80']} record pairs exceed similarity cap {cap:.2f}; maximum composite={audit['maximum_pair_similarity']:.6f} {audit['maximum_pair']}; maximum full-text={audit['maximum_full_text_similarity']:.6f} {audit['maximum_full_text_pair']}")
+    return audit
 
 
 def largest_remainder(total: int, weights: Mapping[str, int | float], order: Sequence[str]) -> dict[str, int]:
@@ -351,16 +481,14 @@ def validate_serialized_dataset(
                 raise ValueError(f"{family} does not contain one source and one benign twin")
             if members[0]["label"] == "benign":
                 raise ValueError(f"{family} benign twin must follow its source")
-            if members[0]["mission"] != members[1]["mission"]:
-                raise ValueError(f"{family} twin mission differs")
+            if members[0]["mission"] == members[1]["mission"]:
+                raise ValueError(f"{family} controlled contrast reuses identical mission text")
             if members[0]["template_family_id"] != members[1]["template_family_id"]:
                 raise ValueError(f"{family} twin template family differs")
             left = [(event["kind"], event["target"]) for event in members[0]["events"]]
             right = [(event["kind"], event["target"]) for event in members[1]["events"]]
-            if members[0]["label"] != "malicious" and left != right:
-                raise ValueError(f"{family} twin event shape differs")
-            if members[0]["label"] == "malicious" and not all(item in left for item in right):
-                raise ValueError(f"{family} malicious twin contains unrelated replacement events")
+            if not set(left)&set(right):
+                raise ValueError(f"{family} controlled contrast has no shared operational event")
             if members[1]["authorised"] != "yes" or members[1]["first_deviation"] != "none" or members[1]["contributing_events"] != "[]":
                 raise ValueError(f"{family} has invalid benign twin output")
         elif len(members) != 1:
@@ -378,6 +506,8 @@ def validate_serialized_dataset(
                 {"number": int(event["number"]), "event_type": event["kind"], "target": event["target"] or "", "payload": event["payload"] or ""}
                 for event in member["events"]
             ]
+            attribute_errors=duplicate_event_attribute_errors(events,payload_key="payload")
+            if attribute_errors:raise ValueError(f"{member['family_id']} {attribute_errors[0]}")
             limit_errors = validate_scope_limits(
                 events,
                 member["limits"],

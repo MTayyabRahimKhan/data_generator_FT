@@ -105,11 +105,12 @@ record. Family structure must not encode the verdict. A selected source and
 twin must:
 
 - share exactly the same `family_id`;
-- use the same mission, event count, event order, event types, and resource
-  names wherever feasible;
+- use the same mission and preserve the order of retained events;
 - differ only in the smallest causal scope or event fact needed to make the
   twin benign;
-- retain the security-sensitive action rather than deleting it;
+- repair approval, limit, action, or target defects directly; when the defect
+  is an unauthorized mission-unrelated side event, remove it instead of
+  authorizing it by broadening scope;
 - make the contrast readily auditable from `SCOPE` plus `EVENTS`;
 - set the twin output to `authorised: yes`, `first_deviation: none`,
   `contributing_events: []`, and `label: benign`.
@@ -122,6 +123,43 @@ Benign twins count toward `--cases N`. The requested value is the exact final
 number of serialized items, including both source items and twins. The
 label distribution applies to the final serialized records. Generated twins
 consume both output slots and the 35% benign quota.
+
+For every benign record, each state-changing event must also plausibly serve
+the stated mission. Passing action and target allowlists is necessary but not
+sufficient. A twin must never retain a mission-unrelated violating operation
+solely by adding its action or resource to `SCOPE`.
+
+The mission's primary verb, objective, and resource must agree with the
+principal operation. In particular, `role.grant` missions use
+grant/provision/restore/renew language, while `role.revoke` missions use
+revoke/remove/withdraw/terminate language. Benign and suspicious records may
+not contain mission-unrelated material side effects.
+
+Rollback effects are explicit rather than inferred. A successful rollback
+must name its affected target and include `reverts_event=N` or
+`reverts_events=N,M` plus `result=reverted`. A failed rollback uses
+`result=failed`; it does not erase the original effect. `OUTPUT.changed`
+derives final disposition only from those explicit links.
+
+Authorization precedence is: explicit forbidden rule, required approval,
+explicit numeric limit, exact allow membership, then contextual permission.
+An explicit prohibition therefore wins over a general allow. Intentional
+allow/forbid examples should use a specific `action:target` exception, and the
+explanation must state that the explicit prohibition takes precedence.
+
+Event payload attributes are unique within each semicolon-delimited detail
+string. Rollback cause uses `trigger_status`; rollback outcome uses `result`,
+so one field never carries both meanings. Explanations may mention contextual
+causes or an operational trigger only when the same concept is present in the
+mission, scope, or events.
+
+All final records, including controlled contrasts and cross-domain records,
+share one identifier-normalized similarity pool. Family and template IDs and
+literal labels are excluded from scoring. The weighted mission/scope/event/
+detail/output similarity and the independent normalized full-record check must
+both be at most `0.80` for every pair. Callers generating later batches pass
+the earlier public records through `similarity_pool`; joint Database/Telecom
+generation uses `generate_joint_datasets` so the index is not reset.
 
 ### Event-Neutrality and Label-Leakage Rules
 

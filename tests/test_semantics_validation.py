@@ -10,14 +10,67 @@ from db_data_generator.generate_dataset import (
 )
 from security_trace_core import (
     approval_evidence_indices, baseline_outlier_indices, find_baseline_outliers,
-    find_evidence_gap_events, find_limit_exceedances, limit_exceedance_indices,
+    derive_changed, duplicate_event_attribute_errors, find_action_scope_violations, find_evidence_gap_events, find_limit_exceedances, limit_exceedance_indices,
     required_approval_violation_indices, validate_scope_limits,
+    validate_changed,
 )
+from db_data_generator.generate_dataset import DATABASE_EVENT_STATE_REGISTRY
 from telcosecgen.engine import (
     AUTHORIZED, EVIDENCE_GAP, TELECOM_SCOPE_SEMANTICS, VIOLATION, _event,
     find_scope_violations, generate_dataset, public_case,
     reconcile_authorized_scope, scope_reconciliation_errors, validate_case,
 )
+
+
+class ChangedDescriptionSemanticsTests(unittest.TestCase):
+    def test_child_object_and_row_operations_do_not_overstate_effect(self):
+        kinds=("index.create","index.drop","retention.delete","duplicate.delete","column.add","column.drop","column.type_migrate","constraint.add","schema.alter","stats.refresh","maintenance.vacuum")
+        events=[{"number":i,"event_type":kind,"target":"orders","detail":""} for i,kind in enumerate(kinds,1)]
+        changed=derive_changed(events,DATABASE_EVENT_STATE_REGISTRY)
+        self.assertIn("created an index on orders",changed[0])
+        self.assertIn("dropped an index on orders",changed[1])
+        self.assertIn("applied retention deletion to orders",changed[2])
+        self.assertIn("removed confirmed duplicate rows from orders",changed[3])
+        self.assertNotIn("deleted orders",changed[1]+changed[2]+changed[3])
+
+    def test_rollback_is_explicit(self):
+        events=[
+            {"number":1,"event_type":"data.patch","target":"orders","detail":""},
+            {"number":2,"event_type":"db.transaction.rollback","target":"orders","detail":"reverts_event=1;result=reverted"},
+        ]
+        self.assertIn("attempted change reverted by event 2 rollback",derive_changed(events,DATABASE_EVENT_STATE_REGISTRY)[0])
+
+    def test_ambiguous_rollback_is_not_inferred(self):
+        events=[
+            {"number":1,"event_type":"data.patch","target":"orders","detail":""},
+            {"number":2,"event_type":"db.transaction.rollback","target":"orders","detail":"result=reverted"},
+        ]
+        self.assertNotIn("reverted",derive_changed(events,DATABASE_EVENT_STATE_REGISTRY)[0])
+        self.assertTrue(any("lacks explicit" in error for error in validate_changed(events,derive_changed(events,DATABASE_EVENT_STATE_REGISTRY),DATABASE_EVENT_STATE_REGISTRY)))
+
+    def test_failed_rollback_keeps_change_effective(self):
+        events=[
+            {"number":1,"event_type":"data.patch","target":"orders","detail":""},
+            {"number":2,"event_type":"db.transaction.rollback","target":"orders","detail":"reverts_event=1;result=failed"},
+        ]
+        self.assertIn("rollback attempt failed",derive_changed(events,DATABASE_EVENT_STATE_REGISTRY)[0])
+
+
+class ForbiddenPrecedenceTests(unittest.TestCase):
+    def test_specific_forbidden_pair_overrides_general_allow(self):
+        events=[{"number":1,"event_type":"audit.clear","target":"database_audit","detail":""}]
+        violations=find_action_scope_violations(
+            events,allowed_reads=(),allowed_writes=("database_audit",),
+            allowed_actions=("audit.clear",),forbidden=("audit.clear:database_audit",),
+            registry=DATABASE_EVENT_STATE_REGISTRY,
+        )
+        self.assertEqual(violations,[1])
+
+
+class EventAttributeUniquenessTests(unittest.TestCase):
+    def test_duplicate_event_keys_are_rejected(self):
+        events=[{"number":1,"event_type":"ticket.read","target":"approval","payload":"approval_status=valid;approval_status=expired"}]
+        self.assertEqual(duplicate_event_attribute_errors(events,payload_key="payload"),["event 1 repeats attribute approval_status"])
 
 
 class TelecomScopeReconciliationTests(unittest.TestCase):

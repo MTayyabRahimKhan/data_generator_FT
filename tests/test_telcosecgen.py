@@ -8,9 +8,10 @@ import unittest
 from collections import Counter
 from pathlib import Path
 
-from security_trace_format import leakage_matches, mission_similarity, validate_serialized_dataset
+from security_trace_format import leakage_matches, mission_similarity, normalized_full_record_similarity, record_similarity, validate_serialized_dataset
 from telcosecgen.engine import (
-    VERDICTS, allocate_largest_remainder, dataset_cases, generate_dataset,
+    APPROVAL_VIOLATION_WEIGHTS, VERDICTS, _approval_violation_subtype,
+    allocate_largest_remainder, dataset_cases, generate_dataset,
     load_config, public_case, serialize_dataset, validate_dataset,
 )
 from security_trace_core import (
@@ -54,8 +55,12 @@ class TelecomGeneratorTests(unittest.TestCase):
                 self.assertIn(requirement["target"],set(case["SCOPE"]["allowed reads"])|set(case["SCOPE"]["allowed writes"]))
                 self.assertTrue(any((event["event_type"],event["target"])==(requirement["action"],requirement["target"]) for event in case["EVENTS"]))
         misaligned=[case["OUTPUT"]["explanation"] for case in self.cases if case["OUTPUT"]["verdict"]=="misaligned"]
-        markers=("exceeding the explicit","does not validly cover","write target","read target","absent from allowed telecom actions","explicitly forbidden")
+        markers=("exceeding the explicit","does not validly cover","write target","read target","absent from allowed telecom actions","explicit prohibition takes precedence")
         self.assertTrue(all(any(marker in explanation for explanation in misaligned) for marker in markers))
+
+    def test_all_definite_approval_failure_subtypes_are_covered(self):
+        found={status for case in self.cases if (status:=_approval_violation_subtype(case))}
+        self.assertEqual(found,set(APPROVAL_VIOLATION_WEIGHTS))
 
     def test_every_non_benign_source_has_contributing_events(self):
         self.assertTrue(all(case["OUTPUT"]["contributing_events"] for case in self.cases if case["OUTPUT"]["verdict"]!="benign"))
@@ -103,9 +108,10 @@ class TelecomGeneratorTests(unittest.TestCase):
             twin=expanded[index+1]
             self.assertEqual(twin["family_id"],case["family_id"])
             self.assertEqual(twin["OUTPUT"]["verdict"],"benign")
-            self.assertEqual(twin["MISSION"],case["MISSION"])
-            if case["OUTPUT"]["verdict"]!="malicious":self.assertEqual([(e["event_type"],e["target"]) for e in twin["EVENTS"]],[(e["event_type"],e["target"]) for e in case["EVENTS"]])
-            else:self.assertFalse(any(event["_intent"]=="violation" for event in twin["EVENTS"]))
+            self.assertNotEqual(twin["MISSION"],case["MISSION"])
+            self.assertLessEqual(record_similarity(public_case(case),public_case(twin)),.80)
+            self.assertLessEqual(normalized_full_record_similarity(public_case(case),public_case(twin)),.80)
+            self.assertFalse(any(event["_intent"]=="violation" for event in twin["EVENTS"]))
             self.assertEqual(twin["OUTPUT"]["first_deviation"],"none")
 
     def test_no_label_leakage_and_forbidden_diversity(self):

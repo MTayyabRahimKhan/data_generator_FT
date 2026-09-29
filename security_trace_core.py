@@ -135,6 +135,32 @@ def describe_state_effect(event: Any, semantics: EventSemantics) -> str:
     """Describe an effect from the event itself, never from a mission template."""
     kind = _event_value(event, "event_type")
     target = _event_value(event, "target")
+    # Some operations act on a child object or on rows within the named
+    # resource.  Their wording must not imply that the resource itself was
+    # created or deleted.
+    exact = {
+        "index.create": "created an index on",
+        "index.drop": "dropped an index on",
+        "retention.delete": "applied retention deletion to",
+        "duplicate.delete": "removed confirmed duplicate rows from",
+        "column.add": "added a column to",
+        "column.drop": "dropped a column from",
+        "column.type_migrate": "changed a column type on",
+        "constraint.add": "added a constraint to",
+        "constraint.drop": "dropped a constraint from",
+        "schema.alter": "altered schema configuration for",
+        "stats.refresh": "refreshed optimizer statistics for",
+        "maintenance.vacuum": "performed vacuum/storage maintenance on",
+        "role.grant": "granted permissions/role on",
+        "role.revoke": "revoked permissions/role on",
+        "data.patch": "patched data in",
+        "data.backfill": "backfilled data in",
+        "data.repair": "repaired data in",
+        "import.complete": "imported data/artifact into",
+        "export.complete": "exported/wrote an artifact to",
+    }
+    if kind in exact:
+        return f"{exact[kind]} {target} [{kind}]"
     verbs = {
         "create": "created", "delete": "deleted", "update": "updated",
         "permission_grant": "granted permissions on",
@@ -164,14 +190,20 @@ def derive_changed(
 ) -> tuple[str, ...]:
     """Derive all observed state/external effects from accepted events.
 
-    A rollback is defined as reverting all earlier rollback-sensitive events in
-    the same trace.  This matches the generators' single-transaction model.
+    Rollbacks affect only the earlier event numbers named by ``reverts_event``
+    or ``reverts_events``.  Ambiguous rollback events never cause inferred
+    reversion.
     """
-    rollback_numbers = [
-        int(_event_value(event, "number"))
-        for event in events
-        if _event_value(event, "event_type") in rollback_types
-    ]
+    rollback_by_event: dict[int, tuple[int, str]] = {}
+    for event in events:
+        if _event_value(event, "event_type") not in rollback_types:
+            continue
+        facts = _event_facts(event)
+        raw = facts.get("reverts_event", facts.get("reverts_events", ""))
+        status = facts.get("result", facts.get("state", ""))
+        for value in raw.split(","):
+            if value.strip().isdigit():
+                rollback_by_event[int(value.strip())] = (int(_event_value(event, "number")), status)
     changed: list[str] = []
     for event in events:
         event_type = _event_value(event, "event_type")
@@ -182,9 +214,13 @@ def derive_changed(
             continue
         number = int(_event_value(event, "number"))
         description = f"event {number}: {describe_state_effect(event, semantics)}"
-        reverting = next((item for item in rollback_numbers if item > number), None)
-        if reverting is not None and semantics.rollback_sensitive:
-            description += f"; attempted change reverted by event {reverting} rollback"
+        rollback = rollback_by_event.get(number)
+        if rollback is not None and rollback[0] > number:
+            rollback_number, status = rollback
+            if status == "reverted" and semantics.rollback_sensitive:
+                description += f"; attempted change reverted by event {rollback_number} rollback"
+            elif status == "failed":
+                description += f"; event {rollback_number} rollback attempt failed"
         changed.append(description)
     return tuple(changed)
 
@@ -218,6 +254,31 @@ def validate_changed(
             errors.append(f"changed description does not match event {number}")
     if tuple(changed) != expected:
         errors.append("changed does not exactly represent all event state effects")
+    for event in events:
+        if _event_value(event, "event_type") not in {"rollback.execute", "db.transaction.rollback"}:
+            continue
+        number=int(_event_value(event,"number"));facts=_event_facts(event)
+        status=facts.get("result",facts.get("state",""))
+        raw=facts.get("reverts_event",facts.get("reverts_events",""))
+        if status not in {"reverted","failed"}:
+            errors.append(f"rollback event {number} lacks a clear result indicator")
+        if status in {"reverted","failed"} and not raw:
+            errors.append(f"rollback event {number} lacks explicit reverts_event linkage")
+            continue
+        for value in raw.split(",") if raw else ():
+            if not value.strip().isdigit() or int(value)>=number or int(value) not in by_number:
+                errors.append(f"rollback event {number} has invalid reverted event reference {value!r}")
+                continue
+            original=by_number[int(value)]
+            original_semantics=registry.get(_event_value(original,"event_type"))
+            if original_semantics is None or not original_semantics.reportable:
+                errors.append(f"rollback event {number} references non-material event {value}")
+            elif status=="reverted" and not original_semantics.rollback_sensitive:
+                errors.append(f"rollback event {number} claims to revert an irreversible effect")
+            rollback_target=str(_event_value(event,"target"));original_target=str(_event_value(original,"target"))
+            affected=facts.get("affected_target","")
+            if rollback_target!=original_target and affected!=original_target and not rollback_target.lower().startswith("transaction/"):
+                errors.append(f"rollback event {number} target does not identify reverted target {original_target}")
     return errors
 
 
@@ -285,6 +346,55 @@ def _event_facts(event: Any, payload_key: str | None = None) -> dict[str, str]:
 def event_facts(event: Any, *, payload_key: str | None = None) -> dict[str, str]:
     """Public, read-only view of normalized factual event payload fields."""
     return _event_facts(event, payload_key)
+
+
+def duplicate_event_attribute_errors(events: Sequence[Any], *, payload_key: str | None = None) -> list[str]:
+    """Reject repeated semicolon-delimited attribute keys within one event."""
+    errors: list[str] = []
+    for event in events:
+        if payload_key is not None:
+            value = _event_value(event, payload_key)
+        elif isinstance(event, Mapping):
+            value = event.get("payload", event.get("detail", ""))
+        else:
+            value = getattr(event, "detail", getattr(event, "payload", ""))
+        seen: set[str] = set()
+        for field in str(value).split(";"):
+            if "=" not in field:
+                continue
+            key=field.split("=",1)[0].strip().lower()
+            if not re.fullmatch(r"[a-z][a-z0-9_]*",key):
+                continue
+            if key in seen:
+                errors.append(f"event {_event_value(event, 'number')} repeats attribute {key}")
+            seen.add(key)
+    return errors
+
+
+def validate_explanation_grounding(
+    mission: str,
+    scope: Mapping[str, Any],
+    events: Sequence[Any],
+    explanation: str,
+    *,
+    payload_key: str | None = None,
+) -> list[str]:
+    """Detect unsupported contextual claims while allowing direct evidence prose."""
+    evidence=" ".join((mission,repr(scope),*(str(_event_value(event,payload_key)) if payload_key else str(event) for event in events))).lower()
+    errors: list[str]=[]
+    contextual_phrases=(
+        "customer escalation","compliance review","disaster-recovery drill",
+        "capacity review","security investigation","post-change observation",
+        "maintenance rationale","audit request","production incident",
+    )
+    lowered=explanation.lower()
+    for phrase in contextual_phrases:
+        if phrase in lowered and phrase not in evidence:
+            errors.append(f"explanation contains unsupported context {phrase!r}")
+    trigger=re.search(r"operational trigger was ([^.]+)",explanation,re.IGNORECASE)
+    if trigger and trigger.group(1).strip().lower() not in evidence:
+        errors.append("explanation contains an unsupported operational trigger")
+    return errors
 
 
 def _event_measurements(event: Any, payload_key: str | None = None) -> dict[str, int]:

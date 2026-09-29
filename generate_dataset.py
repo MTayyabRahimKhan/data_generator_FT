@@ -8,11 +8,27 @@ import sys
 from pathlib import Path
 
 from db_data_generator.generate_dataset import DEFAULT_CONFIG as DB_CONFIG
+from db_data_generator.generate_dataset import dataset_cases as expand_database
+from db_data_generator.generate_dataset import generate_cases as generate_database
+from db_data_generator.generate_dataset import public_item as public_database
 from db_data_generator.generate_dataset import run_generation as run_database
 from telcosecgen.engine import CONTEXTS, VERDICTS, GenerationError
 from telcosecgen.engine import generate_dataset as generate_telecom
 from telcosecgen.engine import load_config as load_telecom_config
 from telcosecgen.engine import serialize_dataset as serialize_telecom
+from telcosecgen.engine import dataset_cases as expand_telecom
+from telcosecgen.engine import public_case as public_telecom
+from security_trace_format import validate_global_similarity
+
+
+def generate_joint_datasets(database_total: int, telecom_total: int, seed: int = 42):
+    """Generate both domains against one cumulative similarity pool."""
+    database_cases=generate_database(database_total,seed)
+    database_items=[public_database(case) for case in expand_database(database_cases)]
+    telecom_cases,telecom_plan=generate_telecom(telecom_total,seed,similarity_pool=database_items)
+    telecom_items=[public_telecom(case) for case in expand_telecom(telecom_cases,database_items)]
+    audit=validate_global_similarity([*database_items,*telecom_items])
+    return database_cases,telecom_cases,telecom_plan,audit
 
 
 def positive_integer(value: str) -> int:

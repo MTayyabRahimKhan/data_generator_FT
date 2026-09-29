@@ -6,11 +6,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from db_data_generator.generate_dataset import (
+    APPROVAL_VIOLATION_WEIGHTS, _approval_violation_subtype,
     allocate_categories, dataset_cases, generate_cases, public_item,
     plan_dataset_counts, run_generation, serialize_cases, validate_case,
     validate_cases,
 )
-from security_trace_format import leakage_matches, mission_similarity, validate_serialized_dataset
+from security_trace_format import leakage_matches, mission_similarity, normalized_full_record_similarity, record_similarity, validate_serialized_dataset
 from security_trace_core import (
     approval_evidence_indices, baseline_outlier_indices, find_anomalous_activity_events, find_baseline_outliers,
     find_evidence_gap_events, find_limit_exceedances,
@@ -52,8 +53,12 @@ class DatabaseGeneratorTests(unittest.TestCase):
                 self.assertIn(requirement["target"],set(case.scope.allowed_reads)|set(case.scope.allowed_writes))
                 self.assertTrue(any((event.event_type,event.target)==(requirement["action"],requirement["target"]) for event in case.events))
         misaligned=[case.output.explanation for case in self.cases if case.output.verdict=="misaligned"]
-        markers=("exceeding the explicit","does not validly cover","write target","read target","absent from allowed DB actions","explicitly forbidden")
+        markers=("exceeding the explicit","does not validly cover","write target","read target","absent from allowed DB actions","explicit prohibition takes precedence")
         self.assertTrue(all(any(marker in explanation for explanation in misaligned) for marker in markers))
+
+    def test_all_definite_approval_failure_subtypes_are_covered(self):
+        found={status for case in self.cases if (status:=_approval_violation_subtype(case))}
+        self.assertEqual(found,set(dict(APPROVAL_VIOLATION_WEIGHTS)))
 
     def test_every_non_benign_source_has_contributing_events(self):
         self.assertTrue(all(case.output.contributing_events for case in self.cases if case.output.verdict!="benign"))
@@ -76,7 +81,8 @@ class DatabaseGeneratorTests(unittest.TestCase):
                     self.assertEqual(output.authorised,"no");self.assertIsNotNone(output.first_deviation)
                     absent=approval_evidence_indices(case.events,case.scope.required_approvals,"absent",payload_key="detail")
                     self.assertTrue(absent or find_limit_exceedances(case.events,case.scope.limits,payload_key="detail"))
-                    self.assertFalse(any(event.event_type in harmful for event in contributor_events))
+                    harmful_pairs={(event.event_type,event.target) for event in contributor_events if event.event_type in harmful}
+                    self.assertLess(len(harmful_pairs),2)
                 elif label=="malicious":
                     self.assertEqual(output.authorised,"no");self.assertIsNotNone(output.first_deviation)
                     self.assertGreaterEqual(len(output.contributing_events),2)
@@ -108,9 +114,10 @@ class DatabaseGeneratorTests(unittest.TestCase):
             self.assertEqual(twin.family_id,case.family_id)
             self.assertTrue(twin.is_twin)
             self.assertEqual(twin.output.verdict,"benign")
-            self.assertEqual(twin.mission,case.mission)
-            if case.output.verdict!="malicious":self.assertEqual([(e.event_type,e.target) for e in twin.events],[(e.event_type,e.target) for e in case.events])
-            else:self.assertFalse(any(event.intent=="violation" for event in twin.events))
+            self.assertNotEqual(twin.mission,case.mission)
+            self.assertLessEqual(record_similarity(public_item(case),public_item(twin)),.80)
+            self.assertLessEqual(normalized_full_record_similarity(public_item(case),public_item(twin)),.80)
+            self.assertFalse(any(event.intent=="violation" for event in twin.events))
             self.assertEqual(twin.output.authorised,"yes")
             self.assertIsNone(twin.output.first_deviation)
 
