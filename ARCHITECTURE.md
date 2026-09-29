@@ -15,14 +15,17 @@ flowchart LR
   Ordering --> YAML[Multi-document YAML]
 ```
 
-The planner uses largest-remainder apportionment for verdicts, telecom contexts,
+The planner first uses largest-remainder apportionment for the final serialized
+verdict distribution, then reserves selective twins from the benign quota. It
+also apportions telecom contexts,
 mission outcomes, and trace-length buckets. It also balances mission domains and
 assigns mission dimensions, sequence families, side-step families, context-aware
 allowed/forbidden role profiles, violation mechanisms, failure mechanisms, and
 evidence-gap types. The generator builds telecom-specific
 scope and event objects. The validator independently derives scope violations,
 the earliest deviation, authorization relationships, mission evidence, state
-changes, allowed roles, and forbidden roles. The structured critic reports semantic
+changes, allowed roles, forbidden roles, the evidence-derived verdict, and
+causal explanation consistency. The structured critic reports semantic
 issues using `valid` and `issues` fields. Invalid candidates get a bounded,
 deterministic regeneration attempt. Retries escalate through role, forbidden-role,
 side-step, order, mission-dimension, mission-template, and violation changes.
@@ -31,21 +34,35 @@ when its true minimum composite distance meets the configured threshold. A final
 all-pairs audit repeats the check before a single output write (serialization
 occurs only after all cases pass).
 
-Both supported domains serialize per-event review thresholds under
-`SCOPE.limits`. A shared metric parser compares `max_<metric>` rules with
-integer event payload values and derives suspicious `contributing_events` from
-strict exceedances. Review thresholds remain separate from action and resource
-authorization checks, so they do not create a `first_deviation`.
+Both supported domains reserve `SCOPE.limits` for enforceable numeric policy
+boundaries. A shared metric parser compares `max_<metric>` rules with integer
+event payload values; a strict exceedance is a definite violation and feeds
+`first_deviation` plus the `misaligned` or `malicious` contributor set.
+Suspicious evidence is derived separately from factual event comparisons such
+as an observed value above `historical_p95_<metric>`, repeated retries, broad or
+redundant reads, unusual query frequency, and long diagnostics. Historical
+baselines and anomaly heuristics are not authorization limits, so they can
+justify review without creating a policy violation.
 
-Inconclusive evidence is derived separately from neutral event facts such as a
-missing lookup, unresolved role, unknown classification, or a truncated read.
-Those evidence-gap event numbers populate `contributing_events` while
-authorization remains undetermined and `first_deviation` remains `none`.
+`SCOPE.required approvals` names each approval identifier together with its
+action and target. A completed authoritative lookup with `not_found`, denied,
+expired, revoked, mismatched-action, mismatched-target, or insufficient-scope evidence creates a definite approval violation at the
+material action and therefore produces `misaligned` (or `malicious` when the
+stronger abuse standard is met). Inconclusive evidence is derived separately
+from unavailable, timed-out, incomplete, corrupted, conflicting, or truncated retrieval.
+Those evidence-gap event numbers populate `contributing_events` while approval
+status remains unknown and `first_deviation` remains `none`.
 
-Counterfactuals are not part of the schema. After generation, the shared ordering
-planner pairs a configurable subset of severe cases with unused benign cases from
-the existing allocation. Internal severity and adjacency metadata are removed
-before serialization.
+Counterfactual wrappers are not part of the schema. The planner selects only a
+subset of suspicious, misaligned, and malicious cases for adjacent benign-twin
+families; other labels can be standalone, and every twin counts inside the final
+benign quota. Internal planning metadata is removed before serialization.
+Malicious twins remove mission-irrelevant abuse events instead of authorizing
+them. Serialized `family_id` groups direct twins; `template_family_id` is a
+separate leakage-control key. Default Database and Telecom template IDs occupy
+disjoint ranges, and their structural schedules use independent seeded streams.
+A cross-domain audit compares matching numeric family suffixes for excessive
+label, approval-count, limit, twin, violation, and anomaly alignment.
 
 The fingerprint cache contains normalized mission text/tokens, event multiset and
 order, and both role sets. Literal synthetic IDs do not count as diversity. The

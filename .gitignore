@@ -38,3 +38,5 @@ Thumbs.db
 /.agents/
 /.codex/
 *.yaml
+data-sets
+data-sets/*
