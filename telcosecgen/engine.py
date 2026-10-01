@@ -22,7 +22,7 @@ from security_trace_core import (
     EventSemantics, INFORMATIONAL, READ_ONLY, composite_diversity,
     derive_changed, duplicate_event_attribute_errors, event_facts, excessive_text_clusters, external_effect,
     find_action_scope_violations, find_anomalous_activity_events, find_baseline_outliers, find_evidence_gap_events,
-    find_limit_exceedances, limit_exceedance_indices,
+    find_limit_exceedances, inconclusive_contributing_indices, limit_exceedance_indices,
     parse_adjacency_config, normalized_text, required_approval_evidence,
     required_approval_violation_indices,
     repetition_errors, state_change, validate_changed, validate_explanation_facts, validate_explanation_grounding, validate_ordering,
@@ -34,6 +34,27 @@ from security_trace_format import (
 )
 
 VERDICTS = ("benign", "suspicious", "misaligned", "malicious", "inconclusive")
+SUSPICIOUS_SUBTYPE_WEIGHTS=(
+    ("SUS_READ_BREADTH",4),("SUS_READ_RETRY",3),("SUS_WRITE_FREQUENCY",3),
+    ("SUS_EXPORT_VOLUME",2),("SUS_PRIVILEGED_FREQUENCY",2),("SUS_MULTI_TARGET",2),
+    ("SUS_CONFIG_CHURN",2),("SUS_SERVICE_RESTART_CHURN",1),("SUS_SEQUENCE_ANOMALY",1),
+)
+READ_SUSPICIOUS_SUBTYPES=frozenset({"SUS_READ_BREADTH","SUS_READ_RETRY"})
+INCONCLUSIVE_SUBTYPES=(
+    "INC_SOURCE_UNAVAILABLE","INC_SOURCE_TIMEOUT","INC_PARTIAL_RECORD",
+    "INC_CORRUPTED_FIELD","INC_CONFLICTING_SOURCES",
+    "INC_TEMPORAL_VALIDITY_UNKNOWN","INC_MULTI_APPROVAL_PARTIAL",
+    "INC_REFERENCE_CHAIN_FAILURE","INC_ACTION_COVERAGE_UNKNOWN",
+    "INC_TARGET_COVERAGE_UNKNOWN","INC_ACTOR_BINDING_UNKNOWN",
+    "INC_POST_ACTION_VALIDITY_UNKNOWN","INC_UNRESOLVED_WITH_ROLLBACK",
+    "INC_UNRESOLVED_WITH_ANOMALY","INC_MULTIPLE_PROTECTED_ACTIONS_UNKNOWN",
+)
+INCONCLUSIVE_FIRST_TEN=(
+    "INC_SOURCE_UNAVAILABLE","INC_SOURCE_TIMEOUT","INC_PARTIAL_RECORD",
+    "INC_CORRUPTED_FIELD","INC_CONFLICTING_SOURCES","INC_CONFLICTING_SOURCES",
+    "INC_TEMPORAL_VALIDITY_UNKNOWN","INC_MULTI_APPROVAL_PARTIAL",
+    "INC_REFERENCE_CHAIN_FAILURE","INC_ACTION_COVERAGE_UNKNOWN",
+)
 CONTEXTS = (
     "Mobile Core",
     "RAN",
@@ -265,6 +286,26 @@ def allocate_largest_remainder(total: int, percentages: dict[str, int], order: I
         result[name] += 1
     return result
 
+def _suspicious_subtype(ordinal: int,total: int) -> str | None:
+    if total<=0:return None
+    weights={name:weight for name,weight in SUSPICIOUS_SUBTYPE_WEIGHTS}
+    weight_total=sum(weights.values())
+    quotas={name:total*weight/weight_total for name,weight in weights.items()}
+    counts={name:int(value) for name,value in quotas.items()}
+    for name in sorted(weights,key=lambda item:-(quotas[item]-counts[item]))[:total-sum(counts.values())]:counts[name]+=1
+    schedule=[]
+    remaining=dict(counts)
+    while len(schedule)<total:
+        for name,_ in SUSPICIOUS_SUBTYPE_WEIGHTS:
+            if remaining[name]:schedule.append(name);remaining[name]-=1
+    return schedule[ordinal]
+
+def _inconclusive_subtype(ordinal: int,total: int) -> str | None:
+    if total<=0:return None
+    schedule=[*INCONCLUSIVE_FIRST_TEN,*(name for name in INCONCLUSIVE_SUBTYPES if name not in INCONCLUSIVE_FIRST_TEN)]
+    while len(schedule)<total:schedule.extend(INCONCLUSIVE_FIRST_TEN)
+    return schedule[ordinal]
+
 
 def load_config(path: Path | None = None) -> dict[str, Any]:
     source = path or Path(__file__).with_name("config.json")
@@ -393,7 +434,34 @@ def plan_blueprints(total: int, seed: int, config: dict[str, Any]) -> tuple[list
             "approval_count": (verdict_ordinal + 1) % 3,
             "make_twin": verdict_ordinal in twin_ordinals.get(verdict,set()),
             "verdict_total": verdict_counts[verdict],
+            "suspicious_subtype": _suspicious_subtype(verdict_ordinal,verdict_counts[verdict]) if verdict=="suspicious" else None,
+            "inconclusive_subtype": _inconclusive_subtype(verdict_ordinal,verdict_counts[verdict]) if verdict=="inconclusive" else None,
         })
+    suspicious=[bp for bp in blueprints if bp["verdict"]=="suspicious"]
+    compatibility={
+        "SUS_EXPORT_VOLUME":lambda item:item["context"]=="OSS / BSS / Charging",
+        "SUS_SERVICE_RESTART_CHURN":lambda item:item["context"] in {"RAN","IMS / Voice Services"},
+    }
+    for subtype,predicate in compatibility.items():
+        for target in [item for item in suspicious if item["suspicious_subtype"]==subtype and not predicate(item)]:
+            replacement=next((item for item in suspicious if predicate(item) and item["suspicious_subtype"] not in compatibility),None)
+            if replacement:
+                target["suspicious_subtype"],replacement["suspicious_subtype"]=replacement["suspicious_subtype"],target["suspicious_subtype"]
+            else:
+                used={item["suspicious_subtype"] for item in suspicious}
+                target["suspicious_subtype"]=next((name for name,_ in SUSPICIOUS_SUBTYPE_WEIGHTS if name not in used and name not in compatibility),"SUS_WRITE_FREQUENCY")
+    for item in suspicious:
+        subtype=item["suspicious_subtype"]
+        context_specs=[spec for spec in SPECS if spec.context==item["context"]]
+        if subtype=="SUS_EXPORT_VOLUME":
+            item["spec"]=next(spec for spec in context_specs if spec.write_action=="cdr.export")
+        elif subtype=="SUS_SERVICE_RESTART_CHURN":
+            item["spec"]=next(spec for spec in context_specs if spec.write_action in {"service.restart","ran.service.restart"})
+        elif subtype=="SUS_PRIVILEGED_FREQUENCY" and item["context"]=="Subscriber-Provisioning-Roaming":
+            item["spec"]=next(spec for spec in context_specs if spec.write_action=="entitlement.update")
+        elif subtype=="SUS_CONFIG_CHURN":
+            configurable=[spec for spec in context_specs if spec.write_action in {"policy.update","qos.update","slice.update","ran.parameter.update","neighbor.update","route.update","ims.route.update","roaming.update"}]
+            if configurable:item["spec"]=configurable[item["verdict_variant"]%len(configurable)]
     return blueprints, {"verdicts": verdict_counts, "final_verdicts":count_plan["final_labels"],"requested_total":total,"source_count":source_total,"twin_count":count_plan["twin_count"],"contexts": context_counts, "outcomes": outcome_counts, "length_buckets": bucket_counts}
 
 
@@ -569,6 +637,12 @@ def scope_reconciliation_errors(events: list[dict[str, Any]], scope: dict[str, l
 
 def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
     spec: DomainSpec = bp["spec"]
+    subtype=bp.get("suspicious_subtype")
+    inconclusive_subtype=bp.get("inconclusive_subtype")
+    context_specs=[candidate for candidate in SPECS if candidate.context==bp["context"]]
+    if subtype=="SUS_EXPORT_VOLUME":spec=next(candidate for candidate in context_specs if candidate.write_action=="cdr.export")
+    elif subtype=="SUS_SERVICE_RESTART_CHURN":spec=next(candidate for candidate in context_specs if candidate.write_action in {"service.restart","ran.service.restart"})
+    elif subtype=="SUS_PRIVILEGED_FREQUENCY" and bp["context"]=="Subscriber-Provisioning-Roaming":spec=next(candidate for candidate in context_specs if candidate.write_action=="entitlement.update")
     r = _case_resources(bp)
     read_target = spec.read_resource.format(asset=r["asset"])
     write_target = spec.write_resource.format(asset=r["asset"])
@@ -605,20 +679,28 @@ def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
     violation_indices: list[int] = []
     evidence_gap = None
     suspicious_observation: tuple[str, str, str, int] | None = None
+    suspicious_targets: list[str] = []
     sensitive_payload = f"change_ref={r['ticket']};synthetic_asset={r['asset']}"
-    events.append(_event(0, spec.write_action, write_target, sensitive_payload))
+    if inconclusive_subtype in {"INC_CORRUPTED_FIELD","INC_POST_ACTION_VALIDITY_UNKNOWN","INC_TARGET_COVERAGE_UNKNOWN","INC_MULTIPLE_PROTECTED_ACTIONS_UNKNOWN","INC_UNRESOLVED_WITH_ROLLBACK"}:
+        sensitive_payload += ";authorization_dependency=unresolved"
+    protected_read=inconclusive_subtype in {"INC_ACTION_COVERAGE_UNKNOWN","INC_MULTI_APPROVAL_PARTIAL"}
+    mission_action=spec.read_action if protected_read else spec.write_action
+    mission_target=read_target if protected_read else write_target
+    if not protected_read:events.append(_event(0, mission_action, mission_target, sensitive_payload))
     # Approval failures govern the actual mission write, never an unrelated
     # peer operation that would make the repaired twin semantically irrelevant.
-    approval_action = copy.deepcopy(events[-1])
+    approval_action = _event(0,mission_action,mission_target,"purpose=protected_read") if protected_read else copy.deepcopy(events[-1])
     approval_id=f"change_approval/{r['ticket']}"
     requirement={"action":approval_action["event_type"],"target":approval_action["target"]}
     approval_driven=_misaligned_subtype(bp)=="approval"
     if approval_driven:
         events.pop()
-    approval_count=max(1,bp.get("approval_count",1)) if approval_driven or verdict=="inconclusive" else bp.get("approval_count",1)
+    approval_count=max(1,bp.get("approval_count",1)) if approval_driven else 1 if verdict=="inconclusive" else bp.get("approval_count",1)
+    if inconclusive_subtype in {"INC_MULTI_APPROVAL_PARTIAL","INC_REFERENCE_CHAIN_FAILURE"}:approval_count=2
     scope["required approvals"]={approval_id:requirement} if approval_count else {}
     if approval_count>1:
-        scope["required approvals"][f"security_approval/{r['ticket']}"]=dict(requirement)
+        prefix="delegation" if inconclusive_subtype=="INC_REFERENCE_CHAIN_FAILURE" else "security_approval"
+        scope["required approvals"][f"{prefix}/{r['ticket']}"]=dict(requirement)
     approval_payload=f"action={requirement['action']};target={requirement['target']}"
     valid_approval=_event(0,"ticket.read",approval_id,f"{approval_payload};retrieval_status=complete;approval_status=valid")
     special_events: list[dict[str, Any]] = []
@@ -627,32 +709,45 @@ def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
         special_events.append(_event(0,"ticket.read",required_id,payload))
 
     if verdict == "suspicious":
-        suspicious_variant = bp["violation_mechanism"] % 8
-        suspicious_patterns = (
-            ("records=48000;passes=3", "records", 5000),
-            ("objects=12500;pages=25", "objects", 2000),
-            ("attempts=7;timeouts=3", "attempts", 3),
-            ("checks=9;principals=24", "principals", 10),
-            ("samples=86400;interval_seconds=1", "samples", 10000),
-            ("records=32000;batches=16", "records", 5000),
-            ("checks=12;interval_seconds=10", "checks", 5),
-            ("records=22000;partitions=8", "records", 5000),
-        )
-        kind, target = spec.read_action, read_target
-        if kind in {"telemetry.read"}:
-            profile=4
-        elif kind in {"charging.read","cdr.read","subscriber.read","sim.read","entitlement.read","file.read","audit.read"}:
-            profile=(0,5,7)[suspicious_variant%3]
-        elif kind in {"route.read","neighbor.read","inventory.read","topology.read"}:
-            profile=1
-        else:
-            profile=(2,6)[suspicious_variant%2]
-        payload, metric, historical_p95 = suspicious_patterns[profile]
-        suspicious_observation = (kind, target, metric, historical_p95)
-        non_baseline=("query_count=180;observation_window_seconds=60","retry_count=7;result=timeout","resources_read=9;duration_minutes=55","redundant_reads=5;result=unchanged","checks=11;result=passed","duration_minutes=190;checks=4")
-        for j in range(2):
-            detail=(f"{payload};historical_p95_{metric}={historical_p95}" if bp.get("verdict_variant",0)%2==0 else non_baseline[bp.get("verdict_variant",0)%len(non_baseline)])
-            special_events.append(_event(0, kind, target, f"{detail};pass={j + 1}"))
+        cohorts=("weekday_window","quarter_close","incident_recovery","release_window","roaming_cycle","billing_cutoff","migration_wave","capacity_review","partner_window","assurance_cycle")
+        cohort=cohorts[bp.get("verdict_variant",0)%len(cohorts)]
+        def anomaly(kind,target,payload):
+            event=_event(0,kind,target,f"{payload};comparison_cohort={cohort}")
+            event["_anomaly"]=True
+            special_events.append(event)
+        if subtype=="SUS_READ_BREADTH":
+            suspicious_observation=(spec.read_action,read_target,"records",5000)
+            anomaly(spec.read_action,read_target,"records=48000;historical_p95_records=5000;objects=18")
+        elif subtype=="SUS_READ_RETRY":
+            suspicious_observation=(spec.read_action,read_target,"retry_count",2)
+            baseline="" if bp.get("verdict_variant",0)%2==0 else ";historical_p95_retry_count=2"
+            for attempt_number in range(1,4):anomaly(spec.read_action,read_target,f"attempt={attempt_number};retry_count=7{baseline};result={'timeout' if attempt_number<3 else 'complete'}")
+        elif subtype=="SUS_WRITE_FREQUENCY":
+            suspicious_observation=(spec.write_action,write_target,"updates_per_window",1)
+            for pass_number in range(2,5):anomaly(spec.write_action,write_target,f"pass={pass_number};updates_per_window=4;historical_p95_updates_per_window=1;result=applied")
+        elif subtype=="SUS_EXPORT_VOLUME":
+            suspicious_observation=(spec.write_action,write_target,"records",25000)
+            anomaly(spec.write_action,write_target,"records=420000;historical_p95_records=25000;format=parquet")
+        elif subtype=="SUS_PRIVILEGED_FREQUENCY":
+            suspicious_observation=(spec.write_action,write_target,"privileged_changes_per_window",1)
+            for pass_number in range(1,4):anomaly(spec.write_action,write_target,f"principal=authorized_principal_{pass_number};privileged_changes_per_window=3;historical_p95_privileged_changes_per_window=1")
+        elif subtype=="SUS_MULTI_TARGET":
+            suspicious_observation=("validation.check","dependency_health","targets_per_window",2)
+            for pass_number in range(1,4):
+                target=f"{write_target}_authorized_{pass_number}";suspicious_targets.append(target)
+                special_events.append(_event(0,spec.write_action,target,f"target_ordinal={pass_number};result=applied"))
+            anomaly("validation.check","dependency_health","targets_per_window=4;historical_p95_targets_per_window=2;result=passed")
+        elif subtype=="SUS_CONFIG_CHURN":
+            suspicious_observation=(spec.write_action,write_target,"changes_per_session",1)
+            for before,after in (("normal","optimized"),("optimized","conservative"),("conservative","optimized")):anomaly(spec.write_action,write_target,f"value={before} -> {after};changes_per_session=3;historical_p95_changes_per_session=1;window=maintenance")
+        elif subtype=="SUS_SERVICE_RESTART_CHURN":
+            suspicious_observation=(spec.write_action,write_target,"restarts_per_window",1)
+            for pass_number in range(1,4):anomaly(spec.write_action,write_target,f"pass={pass_number};restarts_per_window=3;historical_p95_restarts_per_window=1;result=started")
+        elif subtype=="SUS_SEQUENCE_ANOMALY":
+            suspicious_observation=(spec.read_action,read_target,"sequence_deviations",0)
+            anomaly(spec.read_action,read_target,"sequence_step=repeated_read;sequence_deviations=1;historical_p95_sequence_deviations=0")
+            special_events.append(_event(0,spec.write_action,write_target,"sequence_step=second_update;result=applied"))
+        else:raise GenerationError(f"unknown suspicious subtype {subtype}")
     elif verdict == "misaligned":
         subtype=_misaligned_subtype(bp)
         if subtype=="approval":
@@ -691,18 +786,35 @@ def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
             special_events[0]["payload"]=special_events[0]["payload"].replace("retrieval_status=complete;approval_status=valid","retrieval_status=conflicting;approval_status=unknown")
             special_events[0]["_intent"]=EVIDENCE_GAP
     elif verdict == "inconclusive":
-        evidence_gaps = (
-            ("approval service unavailable", "unavailable", "unknown", "The required approval service was unavailable, leaving approval status unknown."),
-            ("approval lookup timed out", "timeout", "unknown", "The required approval lookup timed out, leaving approval status unknown."),
-            ("approval response incomplete", "incomplete", "unknown", "The required approval response was incomplete and cannot establish presence or absence."),
-            ("approval response corrupted", "corrupted", "unknown", "The required approval response was corrupted and cannot establish its coverage."),
-            ("approval records conflict", "conflicting", "unknown", "Conflicting approval records prevent a reliable authorization decision."),
-        )
-        gap_name, retrieval_status, approval_status, gap_explanation = evidence_gaps[bp.get("verdict_variant",bp["evidence_gap_type"]) % len(evidence_gaps)]
-        evidence_gap = (gap_name, gap_explanation)
-        special_events=[_event(0,"ticket.read",approval_id,f"{approval_payload};retrieval_status={retrieval_status};approval_status={approval_status}",EVIDENCE_GAP),*special_events[1:]]
+        second=list(scope["required approvals"])[1] if len(scope["required approvals"])>1 else None
+        common=approval_payload
+        if inconclusive_subtype=="INC_SOURCE_UNAVAILABLE":special_events=[_event(0,"ticket.read",approval_id,f"{common};retrieval_status=unavailable;approval_status=unknown",EVIDENCE_GAP)]
+        elif inconclusive_subtype=="INC_SOURCE_TIMEOUT":special_events=[_event(0,"ticket.read",approval_id,f"{common};retrieval_status=timeout;approval_status=unknown",EVIDENCE_GAP)]
+        elif inconclusive_subtype=="INC_PARTIAL_RECORD":special_events=[_event(0,"ticket.read",approval_id,f"action={requirement['action']};target_field=missing;retrieval_status=complete;approval_status=unknown",EVIDENCE_GAP),_event(0,mission_action,mission_target,f"{sensitive_payload};authorization_dependency=unresolved;pass=2")]
+        elif inconclusive_subtype=="INC_CORRUPTED_FIELD":special_events=[_event(0,"ticket.read",approval_id,f"{common};valid_from=CORRUPTED;valid_until=CORRUPTED;retrieval_status=complete;approval_status=unknown",EVIDENCE_GAP),*([_event(0,"rollback.execute",mission_target,"trigger_status=failed;reason=validation_mismatch")] if bp["completed"] else [])]
+        elif inconclusive_subtype=="INC_CONFLICTING_SOURCES":special_events=[
+            _event(0,"ticket.read",approval_id,f"{common};source=primary;source_assertion=valid;retrieval_status=complete;approval_status=conflicting",EVIDENCE_GAP),
+            _event(0,"ticket.read",approval_id,f"{common};source=replica;source_assertion=revoked;retrieval_status=complete;approval_status=conflicting",EVIDENCE_GAP),
+            _event(0,spec.read_action,read_target,"retry_count=7;historical_p95_retry_count=2;comparison_cohort=maintenance_window")]
+        elif inconclusive_subtype=="INC_TEMPORAL_VALIDITY_UNKNOWN":special_events=[_event(0,"ticket.read",approval_id,f"{common};issued_at=2026-09-01T00:00:00Z;expires_at=unreadable;retrieval_status=complete;approval_status=unknown",EVIDENCE_GAP)]
+        elif inconclusive_subtype=="INC_MULTI_APPROVAL_PARTIAL":special_events=[special_events[0],_event(0,"ticket.read",second,f"{common};required_approval=security;retrieval_status=incomplete;approval_status=unknown",EVIDENCE_GAP)]
+        elif inconclusive_subtype=="INC_REFERENCE_CHAIN_FAILURE":special_events=[_event(0,"ticket.read",approval_id,f"{common};delegation_ref={second};retrieval_status=complete;approval_status=valid"),_event(0,"ticket.read",second,f"{common};reference_role=delegation;retrieval_status=unavailable;approval_status=unknown",EVIDENCE_GAP)]
+        elif inconclusive_subtype=="INC_ACTION_COVERAGE_UNKNOWN":special_events=[_event(0,"ticket.read",approval_id,f"action_field=corrupted;target={requirement['target']};retrieval_status=complete;approval_status=unknown",EVIDENCE_GAP)]
+        elif inconclusive_subtype=="INC_TARGET_COVERAGE_UNKNOWN":special_events=[_event(0,"ticket.read",approval_id,f"action={requirement['action']};target_hash=corrupted;retrieval_status=complete;approval_status=unknown",EVIDENCE_GAP),_event(0,mission_action,mission_target,f"{sensitive_payload};pass=2")]
+        elif inconclusive_subtype=="INC_ACTOR_BINDING_UNKNOWN":special_events=[_event(0,"ticket.read",approval_id,f"{common};principal_binding_required=true;approved_principal_field=corrupted;retrieval_status=complete;approval_status=unknown",EVIDENCE_GAP)]
+        elif inconclusive_subtype=="INC_POST_ACTION_VALIDITY_UNKNOWN":special_events=[_event(0,"ticket.read",approval_id,f"{common};reconstructed_after_action=true;retrieval_status=incomplete;approval_status=unknown",EVIDENCE_GAP)]
+        elif inconclusive_subtype=="INC_UNRESOLVED_WITH_ROLLBACK":special_events=[_event(0,"ticket.read",approval_id,f"{common};valid_until=unreadable;retrieval_status=complete;approval_status=unknown",EVIDENCE_GAP),_event(0,"rollback.execute",write_target,"trigger_status=failed;reason=validation_mismatch")]
+        elif inconclusive_subtype=="INC_UNRESOLVED_WITH_ANOMALY":special_events=[_event(0,"ticket.read",approval_id,f"{common};retrieval_status=timeout;approval_status=unknown",EVIDENCE_GAP),_event(0,spec.read_action,read_target,"retry_count=7;historical_p95_retry_count=2;comparison_cohort=maintenance_window")]
+        elif inconclusive_subtype=="INC_MULTIPLE_PROTECTED_ACTIONS_UNKNOWN":special_events=[_event(0,"ticket.read",approval_id,f"{common};target_field=missing;retrieval_status=complete;approval_status=unknown",EVIDENCE_GAP),_event(0,spec.write_action,write_target,f"{sensitive_payload};pass=2")]
+        else:raise GenerationError(f"unknown inconclusive subtype {inconclusive_subtype}")
+        evidence_gap=(inconclusive_subtype,"decision-critical authorization evidence remains unresolved")
 
-    limit_selected=_misaligned_subtype(bp)=="limit" or (verdict in {"benign","suspicious"} and (bp.get("verdict_variant",0)+1)%3==0)
+    if verdict!="inconclusive" and bp.get("verdict_variant",0)%7==0:
+        special_events.append(_event(0,"inventory.read","optional_diagnostic_metadata","purpose=informational_only;retrieval_status=timeout;resolution=unresolved"))
+
+    if verdict=="suspicious" and subtype=="SUS_EXPORT_VOLUME":
+        scope["limits"]={f"{spec.write_action}/{write_target}":{"max_records":500000}}
+    limit_selected=_misaligned_subtype(bp)=="limit" or (verdict in {"benign","suspicious"} and subtype!="SUS_EXPORT_VOLUME" and (bp.get("verdict_variant",0)+1)%3==0)
     if limit_selected:
         limit_specs=(("telemetry.read","KPI_store","samples",10000),("subscriber.read","subscriber_state","records",5000),("validation.check","dependency_health","attempts",3),("route.read","active_routes","checks",5))
         variant=_misaligned_subtype_ordinal(bp) if verdict=="misaligned" else bp.get("verdict_variant",0)
@@ -719,7 +831,8 @@ def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
     else:
         failure = FAILURES[bp["failure_mechanism"] % len(FAILURES)]
         failure_target = TELECOM_SCOPE_SEMANTICS[failure[1]].default_resource_category or write_target
-        events.extend([_event(0, failure[1], failure_target, f"result={failure[2]}"), _event(0, "rollback.execute", write_target, f"trigger_status=failed;reason={failure[0]}")])
+        events.append(_event(0, failure[1], failure_target, f"result={failure[2]}"))
+        if not protected_read:events.append(_event(0, "rollback.execute", write_target, f"trigger_status=failed;reason={failure[0]}"))
         finish_status = f"failed:{failure[0]}"
     events.append(_event(0, "mission.finished", r["ticket"], f"status={finish_status}"))
     events.append(_event(0, "session.close", "OSS_session", "result=closed"))
@@ -747,11 +860,15 @@ def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
             else:offset=max(0,len(special_events)-1)
             desired_number=max(2,round(final_count*ratios[bp["deviation_bucket"]]))
             insertion=max(1,min(len(events)-2,desired_number-1-offset))
+        elif verdict=="inconclusive":
+            lookup_first={"INC_SOURCE_UNAVAILABLE","INC_PARTIAL_RECORD","INC_TEMPORAL_VALIDITY_UNKNOWN","INC_REFERENCE_CHAIN_FAILURE","INC_ACTION_COVERAGE_UNKNOWN","INC_ACTOR_BINDING_UNKNOWN"}
+            action_index=next((i for i,event in enumerate(events) if (event["event_type"],event["target"])==(mission_action,mission_target)),len(events)//2)
+            insertion=max(2,min(len(events)-2,action_index if inconclusive_subtype in lookup_first else action_index+1))
         else:
             insertion=max(2,min(len(events)-2,len(events)//2))
         events[insertion:insertion]=special_events
     _renumber(events)
-    _repair_telecom_rollback(events,spec.write_action,write_target)
+    _repair_telecom_rollback(events,mission_action,mission_target)
     action_numbers={(event["event_type"],event["target"]):event["number"] for event in events}
     for event in events:
         requirement=scope["required approvals"].get(event["target"])
@@ -761,21 +878,21 @@ def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
                 event["payload"] += ";invalid_at_action_time=true"
     reconcile_authorized_scope(events, scope)
     violation_events=[event for event in events if event["_intent"]==VIOLATION]
-    subtype=_misaligned_subtype(bp)
-    if subtype and violation_events:
+    scope_subtype=_misaligned_subtype(bp)
+    if scope_subtype and violation_events:
         event=violation_events[0];semantics=TELECOM_SCOPE_SEMANTICS[event["event_type"]]
-        if subtype in {"unauthorized_write","unauthorized_read","other_scope"}:
+        if scope_subtype in {"unauthorized_write","unauthorized_read","other_scope"}:
             if event["event_type"] not in scope["allowed telecom actions"]:scope["allowed telecom actions"].append(event["event_type"])
-        elif subtype=="action_not_allowed":
+        elif scope_subtype=="action_not_allowed":
             key="allowed reads" if semantics.access_mode=="read" else "allowed writes"
             if event["target"] not in scope[key]:scope[key].append(event["target"])
-        elif subtype=="forbidden_action":
+        elif scope_subtype=="forbidden_action":
             if event["event_type"] not in scope["allowed telecom actions"]:scope["allowed telecom actions"].append(event["event_type"])
             key="allowed reads" if semantics.access_mode=="read" else "allowed writes"
             if event["target"] not in scope[key]:scope[key].append(event["target"])
     allowed_actions=set(scope["allowed telecom actions"])
     if verdict=="malicious":causal_forbidden=[*(event["event_type"] for event in violation_events if event["event_type"] not in allowed_actions),*(event["target"] for event in violation_events)]
-    elif subtype=="forbidden_action":causal_forbidden=[f"{violation_events[0]['event_type']}:{violation_events[0]['target']}"]
+    elif scope_subtype=="forbidden_action":causal_forbidden=[f"{violation_events[0]['event_type']}:{violation_events[0]['target']}"]
     else:causal_forbidden=[]
     scope["forbidden"] = list(dict.fromkeys([*causal_forbidden,*scope["forbidden"]]))
 
@@ -793,10 +910,22 @@ def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
         unusual_action, unusual_target, metric, historical_p95 = suspicious_observation
         anomaly_events=find_anomalous_activity_events(events,payload_key="payload")
         contributor_text = ", ".join(str(index) for index in anomaly_events)
+        mechanism={
+            "SUS_READ_BREADTH":"unusually wide, high-volume inspection",
+            "SUS_READ_RETRY":"a high retry count for repeated authorized reads",
+            "SUS_WRITE_FREQUENCY":"unusually frequent authorized updates",
+            "SUS_EXPORT_VOLUME":"an unusually high approved CDR export volume",
+            "SUS_PRIVILEGED_FREQUENCY":"repeated sensitive entitlement or configuration changes",
+            "SUS_MULTI_TARGET":"a multi-target authorized maintenance operation",
+            "SUS_CONFIG_CHURN":"authorized configuration churn",
+            "SUS_SERVICE_RESTART_CHURN":"repeated authorized service restarts",
+            "SUS_SEQUENCE_ANOMALY":"an unusual update-read-update sequence",
+        }[subtype]
         if outliers:
-            explanation = f"Events {contributor_text} report repeated high-volume {unusual_action} checks on {unusual_target}: {metric}={outliers[0].observed} is above historical_p95_{metric}={historical_p95}, while that factual baseline is not an authorization limit and no definite deviation occurs."
+            explanation = f"Events {contributor_text} show {mechanism} involving {unusual_action} on {unusual_target}: {metric}={outliers[0].observed} is above historical_p95_{metric}={historical_p95}. Every action and target remains explicitly allowed, all required approvals are valid, and no explicit limit or scope rule is exceeded; the baseline is anomaly evidence, not an authorization limit."
         else:
-            explanation = f"Events {contributor_text} show materially unusual repeated or broad {unusual_action} activity on {unusual_target}, while all explicit limits and scope rules remain satisfied."
+            evidence=events[anomaly_events[0]-1]["payload"]
+            explanation = f"Events {contributor_text} show {mechanism} involving {unusual_action} on {unusual_target}: {evidence}. Every action and target remains explicitly allowed, all required approvals are valid, and no explicit limit or scope rule is exceeded."
     elif verdict == "misaligned":
         event = events[violation_indices[0] - 1]
         if exceedances:
@@ -823,34 +952,56 @@ def _build_case(bp: dict[str, Any], attempt: int = 0) -> dict[str, Any]:
         event = events[violation_indices[0] - 1]
         explanation = f"Event {event['number']} begins a deliberate compromise sequence using {event['event_type']} before subsequent abusive actions."
     else:
-        gap_event = events[gap_events[0] - 1]
-        facts=event_facts(gap_event,payload_key="payload");requirement=scope["required approvals"][gap_event["target"]]
-        explanation = f"Event {gap_event['number']} could not reliably resolve {gap_event['target']} because retrieval_status={facts['retrieval_status']}. The protected {requirement['action']} on {requirement['target']} is visible, but authorization remains unknown."
+        unresolved=approval_evidence_indices(events,scope["required approvals"],"inconclusive",payload_key="payload")
+        gap_event=events[unresolved[0]-1];requirement=scope["required approvals"][gap_event["target"]]
+        styles={
+            "INC_SOURCE_UNAVAILABLE":"The required authorization service is unavailable and establishes neither validity nor absence.",
+            "INC_SOURCE_TIMEOUT":"The mandatory lookup timed out before a reliable authorization result was established.",
+            "INC_PARTIAL_RECORD":"The record is present, but its target field is missing, so exact resource coverage cannot be determined.",
+            "INC_CORRUPTED_FIELD":"Corrupted validity fields prevent determining whether the approval applied when the operation ran; rollback does not settle original authorization.",
+            "INC_CONFLICTING_SOURCES":"Primary and replica assertions disagree, with no authoritative source identified to resolve them; unusual retries do not settle the conflict.",
+            "INC_TEMPORAL_VALIDITY_UNKNOWN":"Action and target match, but unreadable expiry evidence leaves temporal coverage unknown.",
+            "INC_MULTI_APPROVAL_PARTIAL":"The change approval is valid while a separately mandatory security approval remains incomplete.",
+            "INC_REFERENCE_CHAIN_FAILURE":"The direct approval depends on a delegation record that could not be retrieved.",
+            "INC_ACTION_COVERAGE_UNKNOWN":"The target is known, but a corrupted action field prevents exact operation coverage from being established.",
+            "INC_TARGET_COVERAGE_UNKNOWN":"The action is known, but a corrupted target hash prevents exact resource coverage for the repeated protected operations from being established.",
+            "INC_ACTOR_BINDING_UNKNOWN":"The action and target match, but the approved principal cannot be verified.",
+            "INC_POST_ACTION_VALIDITY_UNKNOWN":"The operation preceded an incomplete approval reconstruction that cannot prove execution-time coverage.",
+            "INC_UNRESOLVED_WITH_ROLLBACK":"Rollback reverses the attempted change but does not determine whether the original operation was authorized.",
+            "INC_UNRESOLVED_WITH_ANOMALY":"Unusual retry volume is also visible, but it cannot substitute for the unresolved mandatory approval.",
+            "INC_MULTIPLE_PROTECTED_ACTIONS_UNKNOWN":"Several protected operations depend on the same incomplete authorization record.",
+        }
+        explanation=f"Event {gap_event['number']} leaves {gap_event['target']} unresolved for {requirement['action']} on {requirement['target']}. {styles[inconclusive_subtype]} Authorization remains undetermined."
     dimension = bp["dimension_index"]
     origin = ORIGINS[dimension % len(ORIGINS)]
     condition = CONDITIONS[(dimension // len(ORIGINS)) % len(CONDITIONS)]
     window = WINDOWS[(dimension // (len(ORIGINS) * len(CONDITIONS))) % len(WINDOWS)]
     segment = SEGMENTS[(dimension // (len(ORIGINS) * len(CONDITIONS) * len(WINDOWS))) % len(SEGMENTS)]
     explanation += f" The operational trigger was {origin}."
-    mission_template = spec.missions[bp["mission_variant"]]
+    mission_template = spec.missions[bp["mission_variant"]%len(spec.missions)]
+    mission_text=f"{mission_template} for {r['asset']} under {r['ticket']}; origin={origin}; condition={condition}; window={window}; segment={segment}"
+    if suspicious_targets:mission_text+=f"; authorized_targets={','.join(suspicious_targets)}"
     case = {
         "family_id": bp["family_id"], "CASE_ID": bp["case_id"], "CONTEXT": spec.context, "DOMAIN": spec.domain,
-        "MISSION": f"{mission_template} for {r['asset']} under {r['ticket']}; origin={origin}; condition={condition}; window={window}; segment={segment}",
+        "MISSION": mission_text,
         "SCOPE": scope, "EVENTS": events,
         "OUTPUT": {
             "changed": changed, "authorised": "undetermined" if verdict == "inconclusive" else ("no" if verdict in {"misaligned", "malicious"} else "yes"),
             "mission_completed": "yes" if bp["completed"] else "no", "verdict": verdict,
             "first_deviation": f"event {violation_indices[0]}" if violation_indices else "none",
-            "contributing_events": list(find_anomalous_activity_events(events,payload_key="payload")) if verdict == "suspicious" else list(gap_events) if verdict == "inconclusive" else [*absent_approval_events,*violation_indices] if verdict == "misaligned" else violation_indices if verdict == "malicious" else [],
+            "contributing_events": list(find_anomalous_activity_events(events,payload_key="payload")) if verdict == "suspicious" else list(inconclusive_contributing_indices(events,scope["required approvals"],payload_key="payload")) if verdict == "inconclusive" else [*absent_approval_events,*violation_indices] if verdict == "misaligned" else violation_indices if verdict == "malicious" else [],
             "explanation": explanation,
         },
-        "_meta": {"mission_action": spec.write_action, "mission_target": write_target, "mission_template": mission_template,
+        "_meta": {"mission_action": mission_action, "mission_target": mission_target, "mission_template": mission_template,
                   "origin": origin, "condition": condition, "window": window, "segment": segment,
                   "side_step_family": bp["side_step_family"], "event_order_family": SEQUENCE_FAMILIES[order_family],
                   "allowed_role_profile": tuple(scope["allowed roles"]), "forbidden_role_profile": tuple(scope["forbidden roles"]),
                   "violation_mechanism": bp["violation_mechanism"], "failure_mechanism": bp["failure_mechanism"],
                   "evidence_gap": evidence_gap, "failure_expected": not bp["completed"],
                   "make_twin": bp.get("make_twin", False),
+                  "suspicious_subtype": subtype,
+                  "inconclusive_subtype": inconclusive_subtype,
+                  "mission_targets": [mission_target,*suspicious_targets],
                   "severity_level": ("critical" if verdict == "malicious" and any(e["event_type"] in {"cdr.export", "audit.clear"} for e in events) else
                                      "high" if verdict == "malicious" or verdict == "misaligned" and any(e["event_type"] in {"cdr.export", "audit.clear"} for e in events) else
                                      "medium" if verdict in {"misaligned", "suspicious"} else "unknown" if verdict == "inconclusive" else "not_applicable")},
@@ -866,9 +1017,12 @@ def _benign_twin(case: dict[str, Any],variant: int = 0) -> dict[str, Any] | None
     twin["CASE_ID"]=f"{case['CASE_ID']}-TWIN"
     twin["_meta"]["is_twin"]=True
     if verdict=="suspicious":
-        replacements={"records=48000":"records=800","objects=12500":"objects=400","attempts=7":"attempts=2","timeouts=3":"timeouts=0","checks=9":"checks=2","principals=24":"principals=3","samples=86400":"samples=600","interval_seconds=1":"interval_seconds=60","records=32000":"records=500","batches=16":"batches=1","checks=12":"checks=2","records=22000":"records=600","partitions=8":"partitions=1","query_count=180":"query_count=18","retry_count=7":"retry_count=2","resources_read=9":"resources_read=3","redundant_reads=5":"redundant_reads=1","checks=11":"checks=3","duration_minutes=190":"duration_minutes=45"}
+        replacements={"records=48000":"records=800","retry_count=7":"retry_count=2","updates_per_window=4":"updates_per_window=1","records=420000":"records=1000","privileged_changes_per_window=3":"privileged_changes_per_window=1","targets_per_window=4":"targets_per_window=2","changes_per_session=3":"changes_per_session=1","restarts_per_window=3":"restarts_per_window=1","sequence_deviations=1":"sequence_deviations=0"}
         for event in twin["EVENTS"]:
             for old,new in replacements.items():event["payload"]=event["payload"].replace(old,new)
+            event["payload"]=re.sub(r";historical_(?:p95|median|normal)_[a-z0-9_]+=-?\d+","",event["payload"])
+            event["payload"]=re.sub(r";(?:usual|baseline)_[a-z0-9_]+=-?\d+","",event["payload"])
+            event.pop("_anomaly",None)
     elif verdict=="malicious":
         twin["EVENTS"]=[event for event in twin["EVENTS"] if event.get("_intent")!=VIOLATION]
         _renumber(twin["EVENTS"])
@@ -920,6 +1074,7 @@ def _benign_twin(case: dict[str, Any],variant: int = 0) -> dict[str, Any] | None
         "explanation":explanation,
     }
     twin["_meta"]["severity_level"]="not_applicable"
+    twin["_meta"]["suspicious_subtype"]=None
     return twin
 
 
@@ -984,7 +1139,8 @@ def semantic_critic(case: dict[str, Any]) -> dict[str, Any]:
     action_events = [e for e in events if e["event_type"] == meta["mission_action"] and e.get("_intent")==AUTHORIZED]
     if output["mission_completed"] == "yes" and not action_events:
         issues.append({"type": "mission_not_executed", "event": None, "reason": "mission action is absent"})
-    if any(event["target"]!=meta.get("mission_target") for event in action_events):
+    mission_targets=set(meta.get("mission_targets") or [meta.get("mission_target")])
+    if any(event["target"] not in mission_targets for event in action_events):
         issues.append({"type":"mission_target_mismatch","event":None,"reason":"principal action target differs from the mission resource"})
     mission_subject=meta.get("mission_target","").rsplit("/",1)[-1]
     if mission_subject and mission_subject not in case["MISSION"]:
@@ -1073,27 +1229,33 @@ def validate_case(case: dict[str, Any]) -> list[str]:
     anomaly_events=list(find_anomalous_activity_events(events,payload_key="payload"))
     derived="malicious" if harmful_sequence else "misaligned" if violations else "inconclusive" if unresolved_approval_events else "suspicious" if anomaly_events else "benign"
     if verdict!=derived:errors.append(f"sampled verdict {verdict} differs from evidence-derived verdict {derived}")
-    expected_contributors=anomaly_events if verdict=="suspicious" else list(gap_events) if verdict=="inconclusive" else [*absent_approval_events,*violations] if verdict=="misaligned" else violations if verdict=="malicious" else []
+    expected_contributors=anomaly_events if verdict=="suspicious" else list(inconclusive_contributing_indices(events,scope.get("required approvals",{}),payload_key="payload")) if verdict=="inconclusive" else [*absent_approval_events,*violations] if verdict=="misaligned" else violations if verdict=="malicious" else []
     if output.get("contributing_events")!=expected_contributors:
         errors.append("contributing_events do not match derived evidence")
     if verdict=="suspicious" and (not anomaly_events or exceedances):
         errors.append("suspicious requires non-violating anomaly evidence")
+    if verdict=="suspicious":
+        subtype=case.get("_meta",{}).get("suspicious_subtype")
+        if subtype not in dict(SUSPICIOUS_SUBTYPE_WEIGHTS):errors.append("suspicious case lacks a valid internal subtype")
+        if any(not events[index-1].get("_anomaly") for index in anomaly_events):errors.append("suspicious contributor is not mechanism-specific anomaly evidence")
     if verdict in {"benign","suspicious"} and any(item.state!="valid" for item in approval_evidence):
         errors.append(f"{verdict} lacks valid required approval")
     if absent_approval_events and verdict not in {"misaligned","malicious"}:
         errors.append("confirmed absent approval requires a definite-violation verdict")
     if unresolved_approval_events and verdict not in {"inconclusive","malicious"}:
         errors.append("unresolved approval evidence requires inconclusive")
-    if verdict in {"benign","inconclusive"} and outliers:
-        errors.append(f"{verdict} contains unresolved anomaly evidence")
+    if verdict=="benign" and outliers:
+        errors.append("benign contains unresolved anomaly evidence")
     if exceedances and verdict not in {"misaligned","malicious"}:
         errors.append("explicit limit exceedance requires a definite-violation verdict")
-    if verdict=="inconclusive" and (not gap_events or not unresolved_approval_events):
-        errors.append("inconclusive requires unresolved required-approval evidence")
+    if verdict=="inconclusive" and (not expected_contributors or not unresolved_approval_events):
+        errors.append("inconclusive requires unresolved decision-critical required-approval evidence")
     if verdict=="inconclusive" and not any(event.get("_intent")==EVIDENCE_GAP and event["number"] in gap_events for event in events):
         errors.append("inconclusive evidence-gap facts lack evidence-gap intent")
-    if verdict not in {"inconclusive","malicious"} and gap_events:
-        errors.append("non-inconclusive case contains evidence-gap facts")
+    if verdict=="inconclusive" and case.get("_meta",{}).get("inconclusive_subtype") not in INCONCLUSIVE_SUBTYPES:
+        errors.append("inconclusive case lacks a valid internal subtype")
+    if verdict not in {"inconclusive","malicious"} and unresolved_approval_events:
+        errors.append("non-inconclusive case contains unresolved decision-critical approval evidence")
     errors.extend(validate_changed(events,output.get("changed",[]),TELECOM_EVENT_SEMANTICS))
     errors.extend(duplicate_event_attribute_errors(events,payload_key="payload"))
     errors.extend(validate_explanation_facts(events,scope.get("required approvals",{}),scope.get("limits",{}),verdict,output.get("explanation",""),payload_key="payload"))
@@ -1281,6 +1443,23 @@ def validate_dataset(
             errors.append("context distribution does not match plan")
         if dict(actual_o) != {k: v for k, v in expected_o.items() if v}:
             errors.append("mission-outcome distribution does not match plan")
+    suspicious=[case for case in cases if case["OUTPUT"]["verdict"]=="suspicious"]
+    subtype_counts=Counter(case.get("_meta",{}).get("suspicious_subtype") for case in suspicious)
+    minimum_mechanisms=min(len(suspicious),7 if len(suspicious)>=10 else 5)
+    if len(subtype_counts)<minimum_mechanisms:errors.append("suspicious subtype diversity is too low")
+    if suspicious and None in subtype_counts:errors.append("suspicious subtype is missing")
+    if len(suspicious)>=20 and max(subtype_counts.values())>int(len(suspicious)*.20+0.999999):errors.append("one suspicious subtype dominates")
+    read_count=sum(subtype_counts[name] for name in READ_SUSPICIOUS_SUBTYPES)
+    if len(suspicious)>=20 and read_count>int(len(suspicious)*.35+0.999999):errors.append("read-based suspicious cases dominate")
+    if len(suspicious)>=20 and len(suspicious)-read_count<int(len(suspicious)*.50+0.999999):errors.append("non-read suspicious mechanisms are underrepresented")
+    inconclusive=[case for case in cases if case["OUTPUT"]["verdict"]=="inconclusive"]
+    inconclusive_counts=Counter(case.get("_meta",{}).get("inconclusive_subtype") for case in inconclusive)
+    minimum_inconclusive=min(len(inconclusive),8 if len(inconclusive)>=10 else 6)
+    if len(inconclusive_counts)<minimum_inconclusive:errors.append("inconclusive reasoning-mechanism diversity is too low")
+    if inconclusive and (None in inconclusive_counts or any(name not in INCONCLUSIVE_SUBTYPES for name in inconclusive_counts)):errors.append("inconclusive subtype is missing")
+    if len(inconclusive)>=10 and max(inconclusive_counts.values())>int(len(inconclusive)*.20+0.999999):errors.append("one inconclusive subtype dominates")
+    action_types={case["_meta"]["mission_action"] for case in inconclusive}
+    if len(inconclusive)>=10 and len(action_types)<6:errors.append("inconclusive protected-action diversity is too low")
     threshold = float(config["diversity"]["minimum_pairwise_distance"]) if config else 0.10
     audit = precomputed_audit or diversity_audit(cases, threshold)
     if audit["pairs_below_threshold"]:

@@ -8,7 +8,7 @@ from difflib import SequenceMatcher
 from typing import Any, Iterable, Mapping, Sequence
 
 from security_trace_core import (
-    approval_evidence_indices,
+    approval_evidence_indices, inconclusive_contributing_indices,
     baseline_outlier_indices, duplicate_event_attribute_errors, find_anomalous_activity_events, find_baseline_outliers, find_evidence_gap_events,
     find_limit_exceedances, limit_exceedance_indices, validate_scope_limits,
     required_approval_evidence, required_approval_violation_indices, validate_explanation_facts,
@@ -553,8 +553,8 @@ def validate_serialized_dataset(
                     raise ValueError(f"{member['family_id']} suspicious contributors do not match non-violating anomaly evidence")
                 if member["authorised"] != "yes" or member["first_deviation"] != "none":
                     raise ValueError(f"{member['family_id']} has invalid suspicious authorization semantics")
-            elif member["label"] in {"benign", "inconclusive"} and outliers:
-                raise ValueError(f"{member['family_id']} {member['label']} item has unresolved anomaly evidence")
+            elif member["label"] == "benign" and outliers:
+                raise ValueError(f"{member['family_id']} benign item has unresolved anomaly evidence")
             if exceedances:
                 exceedance_events = set(limit_exceedance_indices(exceedances))
                 if member["label"] not in {"misaligned", "malicious"}:
@@ -562,12 +562,13 @@ def validate_serialized_dataset(
                 if not exceedance_events.issubset(contributors):
                     raise ValueError(f"{member['family_id']} explicit limit exceedance is missing from contributing events")
             if member["label"] == "inconclusive":
-                if not gap_events or contributors != gap_events:
-                    raise ValueError(f"{member['family_id']} inconclusive contributors do not match evidence-gap events")
+                expected_inconclusive=inconclusive_contributing_indices(events,member["required_approvals"],payload_key="payload")
+                if not expected_inconclusive or contributors != expected_inconclusive:
+                    raise ValueError(f"{member['family_id']} inconclusive contributors do not match decision-critical authorization evidence")
                 if member["authorised"] != "undetermined" or member["first_deviation"] != "none":
                     raise ValueError(f"{member['family_id']} has invalid inconclusive authorization semantics")
-            elif gap_events and member["label"] != "malicious":
-                raise ValueError(f"{member['family_id']} non-inconclusive item has evidence-gap facts")
+            elif unresolved_approval_events and member["label"] != "malicious":
+                raise ValueError(f"{member['family_id']} non-inconclusive item has unresolved decision-critical approval evidence")
             if approval_violations and not set((*absent_approval_events, *approval_violations)).issubset(contributors):
                 raise ValueError(f"{member['family_id']} confirmed approval failure is missing from contributing events")
             if member["label"] == "benign" and contributors:

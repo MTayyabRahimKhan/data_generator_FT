@@ -10,13 +10,13 @@ from pathlib import Path
 
 from security_trace_format import leakage_matches, mission_similarity, normalized_full_record_similarity, record_similarity, validate_serialized_dataset
 from telcosecgen.engine import (
-    APPROVAL_VIOLATION_WEIGHTS, VERDICTS, _approval_violation_subtype,
+    APPROVAL_VIOLATION_WEIGHTS, INCONCLUSIVE_SUBTYPES, VERDICTS, _approval_violation_subtype,
     allocate_largest_remainder, dataset_cases, generate_dataset,
     load_config, public_case, serialize_dataset, validate_dataset,
 )
 from security_trace_core import (
     approval_evidence_indices, baseline_outlier_indices, find_anomalous_activity_events, find_baseline_outliers,
-    find_evidence_gap_events, find_limit_exceedances,
+    find_evidence_gap_events, find_limit_exceedances, inconclusive_contributing_indices,
 )
 
 
@@ -48,7 +48,7 @@ class TelecomGeneratorTests(unittest.TestCase):
         limit_names={name for case in self.cases for thresholds in case["SCOPE"]["limits"].values() for name in thresholds}
         self.assertTrue({"max_samples","max_records","max_attempts","max_checks"}.issubset(limit_names))
         gap_states={re.search(r"retrieval_status=([^;]+)",event["payload"]).group(1) for case in self.cases if case["OUTPUT"]["verdict"]=="inconclusive" for event in case["EVENTS"] if "approval_status=" in event["payload"]}
-        self.assertTrue({"unavailable","timeout","incomplete","corrupted","conflicting"}.issubset(gap_states))
+        self.assertTrue({"complete","unavailable","timeout","incomplete"}.issubset(gap_states))
         for case in self.cases:
             for requirement in case["SCOPE"]["required approvals"].values():
                 self.assertIn(requirement["action"],case["SCOPE"]["allowed telecom actions"])
@@ -57,6 +57,22 @@ class TelecomGeneratorTests(unittest.TestCase):
         misaligned=[case["OUTPUT"]["explanation"] for case in self.cases if case["OUTPUT"]["verdict"]=="misaligned"]
         markers=("exceeding the explicit","does not validly cover","write target","read target","absent from allowed telecom actions","explicit prohibition takes precedence")
         self.assertTrue(all(any(marker in explanation for explanation in misaligned) for marker in markers))
+
+    def test_suspicious_subtype_quota_is_diverse_and_internal(self):
+        suspicious=[case for case in self.cases if case["OUTPUT"]["verdict"]=="suspicious"]
+        counts=Counter(case["_meta"]["suspicious_subtype"] for case in suspicious)
+        self.assertEqual(sorted(counts.values()),[1,1,2,2,2,2,3,3,4])
+        self.assertGreaterEqual(len(counts),7)
+        self.assertLessEqual(counts["SUS_READ_BREADTH"]+counts["SUS_READ_RETRY"],7)
+        self.assertNotIn("SUS_",self.text)
+
+    def test_inconclusive_reasoning_diversity_is_internal(self):
+        cases=[case for case in self.cases if case["OUTPUT"]["verdict"]=="inconclusive"]
+        self.assertEqual(len({case["_meta"]["inconclusive_subtype"] for case in cases}),9)
+        self.assertEqual(Counter(case["_meta"]["inconclusive_subtype"] for case in cases)["INC_CONFLICTING_SOURCES"],2)
+        self.assertTrue({"INC_PARTIAL_RECORD","INC_CONFLICTING_SOURCES","INC_MULTI_APPROVAL_PARTIAL","INC_REFERENCE_CHAIN_FAILURE"}.issubset({case["_meta"]["inconclusive_subtype"] for case in cases}))
+        self.assertGreaterEqual(len({case["_meta"]["mission_action"] for case in cases}),6)
+        self.assertNotIn("INC_",self.text)
 
     def test_all_definite_approval_failure_subtypes_are_covered(self):
         found={status for case in self.cases if (status:=_approval_violation_subtype(case))}
@@ -90,7 +106,7 @@ class TelecomGeneratorTests(unittest.TestCase):
                     self.assertTrue(any(event["event_type"] in harmful for event in contributor_events))
                 else:
                     self.assertEqual((output["authorised"],output["first_deviation"]),("undetermined","none"))
-                    self.assertEqual(output["contributing_events"],list(find_evidence_gap_events(case["EVENTS"],payload_key="payload")))
+                    self.assertEqual(output["contributing_events"],list(inconclusive_contributing_indices(case["EVENTS"],case["SCOPE"]["required approvals"],payload_key="payload")))
                 self.assertTrue(output["explanation"])
 
     def test_exact_public_keys(self):
@@ -165,14 +181,12 @@ class TelecomGeneratorTests(unittest.TestCase):
         for case in (case for case in self.cases if case["OUTPUT"]["verdict"]=="inconclusive"):
             gaps=find_evidence_gap_events(case["EVENTS"],payload_key="payload")
             self.assertTrue(gaps)
-            self.assertEqual(case["OUTPUT"]["contributing_events"],list(gaps))
+            self.assertEqual(case["OUTPUT"]["contributing_events"],list(inconclusive_contributing_indices(case["EVENTS"],case["SCOPE"]["required approvals"],payload_key="payload")))
             self.assertEqual(case["OUTPUT"]["authorised"],"undetermined")
             self.assertEqual(case["OUTPUT"]["first_deviation"],"none")
             event=case["EVENTS"][gaps[0]-1]
             self.assertIn(f"Event {gaps[0]}",case["OUTPUT"]["explanation"])
             self.assertIn(event["target"],case["OUTPUT"]["explanation"])
-            self.assertIn(f"action={case['_meta']['mission_action']}",event["payload"])
-            self.assertTrue(event["target"].startswith("change_approval/"))
             self.assertIn(event["target"],case["SCOPE"]["required approvals"])
             self.assertRegex(event["payload"],r"retrieval_status=(?:unavailable|timeout|incomplete|corrupted|conflicting|complete);approval_status=(?:unknown|conflicting)")
 

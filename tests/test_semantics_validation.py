@@ -10,7 +10,7 @@ from db_data_generator.generate_dataset import (
 )
 from security_trace_core import (
     approval_evidence_indices, baseline_outlier_indices, find_baseline_outliers,
-    derive_changed, duplicate_event_attribute_errors, find_action_scope_violations, find_evidence_gap_events, find_limit_exceedances, limit_exceedance_indices,
+    derive_changed, duplicate_event_attribute_errors, find_action_scope_violations, find_evidence_gap_events, find_limit_exceedances, inconclusive_contributing_indices, limit_exceedance_indices,
     required_approval_violation_indices, validate_scope_limits,
     validate_changed,
 )
@@ -71,6 +71,16 @@ class EventAttributeUniquenessTests(unittest.TestCase):
     def test_duplicate_event_keys_are_rejected(self):
         events=[{"number":1,"event_type":"ticket.read","target":"approval","payload":"approval_status=valid;approval_status=expired"}]
         self.assertEqual(duplicate_event_attribute_errors(events,payload_key="payload"),["event 1 repeats attribute approval_status"])
+
+
+class OperationalBaselineSemanticsTests(unittest.TestCase):
+    def test_supported_baseline_prefixes_are_anomaly_evidence(self):
+        prefixes=("historical_p95_","historical_median_","historical_normal_","usual_","baseline_")
+        for number,prefix in enumerate(prefixes,1):
+            events=[{"number":number,"event_type":"db.query","target":"orders","detail":f"checks=3;{prefix}checks=1"}]
+            outliers=find_baseline_outliers(events,payload_key="detail")
+            self.assertEqual(baseline_outlier_indices(outliers),(number,))
+            self.assertEqual((outliers[0].observed,outliers[0].historical_p95),(3,1))
 
 
 class TelecomScopeReconciliationTests(unittest.TestCase):
@@ -284,6 +294,26 @@ class EvidenceGapSemanticsTests(unittest.TestCase):
         self.assertEqual(find_evidence_gap_events(events,payload_key="payload"),())
         self.assertEqual(approval_evidence_indices(events,required,"absent",payload_key="payload"),(1,))
         self.assertEqual(required_approval_violation_indices(events,required,payload_key="payload"),(2,))
+
+    def test_missing_coverage_field_is_unknown_not_wrong_target(self):
+        required={"approval/1":{"action":"data.patch","target":"records"}}
+        events=[
+            {"number":1,"event_type":"ticket.read","target":"approval/1","payload":"action=data.patch;target_field=missing;retrieval_status=complete;approval_status=unknown"},
+            {"number":2,"event_type":"data.patch","target":"records","payload":"authorization_dependency=unresolved"},
+        ]
+        self.assertEqual(approval_evidence_indices(events,required,"inconclusive",payload_key="payload"),(1,))
+        self.assertEqual(approval_evidence_indices(events,required,"absent",payload_key="payload"),())
+        self.assertEqual(inconclusive_contributing_indices(events,required,payload_key="payload"),(1,2))
+
+    def test_optional_timeout_is_not_decision_critical(self):
+        required={"approval/1":{"action":"data.patch","target":"records"}}
+        events=[
+            {"number":1,"event_type":"ticket.read","target":"approval/1","payload":"action=data.patch;target=records;retrieval_status=complete;approval_status=valid"},
+            {"number":2,"event_type":"metadata.read","target":"optional_diagnostic","payload":"retrieval_status=timeout;resolution=unresolved"},
+            {"number":3,"event_type":"data.patch","target":"records","payload":"rows=4"},
+        ]
+        self.assertEqual(find_evidence_gap_events(events,payload_key="payload"),(2,))
+        self.assertEqual(inconclusive_contributing_indices(events,required,payload_key="payload"),())
 
     def test_eof_without_a_shortfall_is_not_a_gap(self):
         events=[

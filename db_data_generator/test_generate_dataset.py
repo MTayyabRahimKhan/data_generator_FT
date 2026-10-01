@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from db_data_generator.generate_dataset import (
-    APPROVAL_VIOLATION_WEIGHTS, _approval_violation_subtype,
+    APPROVAL_VIOLATION_WEIGHTS, INCONCLUSIVE_SUBTYPES, _approval_violation_subtype,
     allocate_categories, dataset_cases, generate_cases, public_item,
     plan_dataset_counts, run_generation, serialize_cases, validate_case,
     validate_cases,
@@ -14,7 +14,7 @@ from db_data_generator.generate_dataset import (
 from security_trace_format import leakage_matches, mission_similarity, normalized_full_record_similarity, record_similarity, validate_serialized_dataset
 from security_trace_core import (
     approval_evidence_indices, baseline_outlier_indices, find_anomalous_activity_events, find_baseline_outliers,
-    find_evidence_gap_events, find_limit_exceedances,
+    find_evidence_gap_events, find_limit_exceedances, inconclusive_contributing_indices,
 )
 
 
@@ -46,7 +46,7 @@ class DatabaseGeneratorTests(unittest.TestCase):
         limit_names={name for case in self.cases for thresholds in case.scope.limits.values() for name in thresholds}
         self.assertTrue({"max_rows_scanned","max_attempts","max_records","max_samples"}.issubset(limit_names))
         gap_states={re.search(r"retrieval_status=([^;]+)",event.detail).group(1) for case in self.cases if case.output.verdict=="inconclusive" for event in case.events if "approval_status=" in event.detail}
-        self.assertTrue({"unavailable","timeout","incomplete","corrupted","conflicting"}.issubset(gap_states))
+        self.assertTrue({"complete","unavailable","timeout","incomplete"}.issubset(gap_states))
         for case in self.cases:
             for requirement in case.scope.required_approvals.values():
                 self.assertIn(requirement["action"],case.scope.allowed_actions)
@@ -55,6 +55,22 @@ class DatabaseGeneratorTests(unittest.TestCase):
         misaligned=[case.output.explanation for case in self.cases if case.output.verdict=="misaligned"]
         markers=("exceeding the explicit","does not validly cover","write target","read target","absent from allowed DB actions","explicit prohibition takes precedence")
         self.assertTrue(all(any(marker in explanation for explanation in misaligned) for marker in markers))
+
+    def test_suspicious_subtype_quota_is_diverse_and_internal(self):
+        suspicious=[case for case in self.cases if case.output.verdict=="suspicious"]
+        counts=Counter(case.suspicious_subtype for case in suspicious)
+        self.assertEqual(sorted(counts.values()),[1,1,2,2,2,2,3,3,4])
+        self.assertGreaterEqual(len(counts),7)
+        self.assertLessEqual(counts["SUS_READ_BREADTH"]+counts["SUS_READ_RETRY"],7)
+        self.assertNotIn("SUS_",self.text)
+
+    def test_inconclusive_reasoning_diversity_is_internal(self):
+        cases=[case for case in self.cases if case.output.verdict=="inconclusive"]
+        self.assertEqual(len({case.inconclusive_subtype for case in cases}),9)
+        self.assertEqual(Counter(case.inconclusive_subtype for case in cases)["INC_CONFLICTING_SOURCES"],2)
+        self.assertTrue({"INC_PARTIAL_RECORD","INC_CONFLICTING_SOURCES","INC_MULTI_APPROVAL_PARTIAL","INC_REFERENCE_CHAIN_FAILURE"}.issubset({case.inconclusive_subtype for case in cases}))
+        self.assertGreaterEqual(len({next(iter(case.scope.required_approvals.values()))["action"] for case in cases}),6)
+        self.assertNotIn("INC_",self.text)
 
     def test_all_definite_approval_failure_subtypes_are_covered(self):
         found={status for case in self.cases if (status:=_approval_violation_subtype(case))}
@@ -89,7 +105,7 @@ class DatabaseGeneratorTests(unittest.TestCase):
                     self.assertTrue(any(event.event_type in harmful for event in contributor_events))
                 else:
                     self.assertEqual((output.authorised,output.first_deviation),("undetermined",None))
-                    self.assertEqual(output.contributing_events,find_evidence_gap_events(case.events,payload_key="detail"))
+                    self.assertEqual(output.contributing_events,inconclusive_contributing_indices(case.events,case.scope.required_approvals,payload_key="detail"))
                 self.assertTrue(output.explanation)
 
     def test_mission_objectives_match_database_domains(self):
@@ -193,22 +209,20 @@ class DatabaseGeneratorTests(unittest.TestCase):
                 self.assertEqual(document["first_deviation"],"none")
         self.assertIn("  limits: {}\n",self.text)
 
-    def test_inconclusive_records_point_to_unretrievable_mission_approval(self):
+    def test_inconclusive_records_point_to_decision_critical_approval_uncertainty(self):
         for case in (case for case in self.cases if case.output.verdict=="inconclusive"):
             gaps=find_evidence_gap_events(case.events,payload_key="detail")
             self.assertTrue(gaps)
-            self.assertEqual(case.output.contributing_events,gaps)
+            self.assertEqual(case.output.contributing_events,inconclusive_contributing_indices(case.events,case.scope.required_approvals,payload_key="detail"))
             self.assertEqual(case.output.authorised,"undetermined")
             self.assertIsNone(case.output.first_deviation)
             self.assertIn(f"Event {gaps[0]}",case.output.explanation)
             self.assertIn("approval_record/",case.output.explanation)
             event=case.events[gaps[0]-1]
-            self.assertTrue(event.target.startswith("approval_record/"))
-            self.assertRegex(event.detail,r"retrieval_status=(?:unavailable|timeout|incomplete|corrupted|conflicting)")
-            self.assertRegex(event.detail,r"approval_status=(?:unknown|conflicting)")
             self.assertIn(event.target,case.scope.required_approvals)
-            self.assertIn("action=",event.detail)
-            self.assertIn("target=",event.detail)
+            self.assertRegex(event.detail,r"retrieval_status=(?:complete|unavailable|timeout|incomplete|corrupted|conflicting)")
+            self.assertRegex(event.detail,r"approval_status=(?:unknown|conflicting)")
+            self.assertIn("approval_status=",event.detail)
 
     def test_inconclusive_validation_rejects_missing_or_wrong_gap_evidence(self):
         case=next(case for case in self.cases if case.output.verdict=="inconclusive")

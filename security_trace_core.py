@@ -62,7 +62,7 @@ class LimitExceedance:
 
 @dataclass(frozen=True)
 class BaselineOutlier:
-    """One factual observation above its historical p95, not a policy breach."""
+    """One factual observation above an operational baseline, not a policy breach."""
 
     event_number: int
     event_type: str
@@ -498,6 +498,33 @@ def approval_evidence_indices(
     return tuple(item.event_number for item in required_approval_evidence(events, required_approvals, payload_key=payload_key) if item.state == state)
 
 
+def inconclusive_contributing_indices(
+    events: Sequence[Any],
+    required_approvals: Mapping[str, Mapping[str, str]],
+    *,
+    payload_key: str | None = None,
+) -> tuple[int, ...]:
+    """Return the evidence that makes a required authorization undecidable.
+
+    Evidence-gap tokens on optional diagnostics are deliberately ignored.  A
+    protected operation is included only when the trace explicitly marks it as
+    depending on the unresolved authorization fact.  This keeps contributor
+    sets evidence-derived while allowing conflict, post-action, and repeated-
+    action cases to name more than a single lookup event.
+    """
+    unresolved = set(approval_evidence_indices(
+        events, required_approvals, "inconclusive", payload_key=payload_key,
+    ))
+    if not unresolved:
+        return ()
+    dependent = {
+        int(_event_value(event, "number"))
+        for event in events
+        if _event_facts(event, payload_key).get("authorization_dependency") == "unresolved"
+    }
+    return tuple(sorted(unresolved | dependent))
+
+
 def validate_scope_limits(
     events: Sequence[Any],
     limits: Mapping[str, Mapping[str, int]],
@@ -578,28 +605,32 @@ def find_baseline_outliers(
     *,
     payload_key: str | None = None,
 ) -> tuple[BaselineOutlier, ...]:
-    """Derive unusual observations from factual historical-p95 comparisons.
+    """Derive unusual observations from factual operational-baseline comparisons.
 
     Historical baselines describe prior behavior; they are not authorization
     limits. Policy limits belong exclusively in ``SCOPE.limits``.
     """
     outliers: list[BaselineOutlier] = []
-    prefix = "historical_p95_"
+    prefixes = (
+        "historical_p95_", "historical_median_", "historical_normal_",
+        "usual_", "baseline_",
+    )
     for event in events:
         measurements = _event_measurements(event, payload_key)
-        for name, historical_p95 in measurements.items():
-            if not name.startswith(prefix) or historical_p95 <= 0:
+        for name, baseline in measurements.items():
+            prefix = next((candidate for candidate in prefixes if name.startswith(candidate)), None)
+            if prefix is None or baseline < 0:
                 continue
             metric = name[len(prefix):]
             observed = measurements.get(metric)
-            if observed is not None and observed > historical_p95:
+            if observed is not None and observed > baseline:
                 outliers.append(BaselineOutlier(
                     int(_event_value(event, "number")),
                     str(_event_value(event, "event_type")),
                     str(_event_value(event, "target")),
                     metric,
                     observed,
-                    historical_p95,
+                    baseline,
                 ))
     return tuple(outliers)
 
@@ -693,10 +724,11 @@ def validate_explanation_facts(
         else:
             item = unresolved[0]
             event = next(event for event in events if int(_event_value(event, "number")) == item.event_number)
-            status = _event_facts(event, payload_key).get("retrieval_status", "")
-            fragments = (f"Event {item.event_number}", item.approval, f"retrieval_status={status}", item.action, item.target)
+            facts = _event_facts(event, payload_key)
+            status = facts.get("retrieval_status", "")
+            fragments = (f"Event {item.event_number}", item.approval, item.action, item.target)
             if any(fragment not in explanation for fragment in fragments):
-                errors.append("inconclusive explanation does not preserve exact retrieval evidence")
+                errors.append("inconclusive explanation does not identify the unresolved approval and protected operation")
             for other in ("unavailable", "timeout", "incomplete", "corrupted", "conflicting"):
                 if other != status and f"retrieval_status={other}" in explanation:
                     errors.append("inconclusive explanation contradicts retrieval status")
